@@ -1,0 +1,17 @@
+aiohappyeyeballs==2.6.1
+aiohttp==3.13.2
+aiosignal==1.4.0
+attrs==25.4.0
+frozenlist==1.8.0
+idna==3.11
+multidict==6.7.0
+numpy==2.3.5
+pandas==2.3.3
+propcache==0.4.1
+python-dateutil==2.9.0.post0
+pytz==2025.2
+six==1.17.0
+typing_extensions==4.15.0
+tzdata==2025.2
+websockets==15.0.1
+yarl==1.22.0
