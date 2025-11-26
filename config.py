@@ -3,10 +3,12 @@ from dataclasses import dataclass
 @dataclass
 class CollectorConfig:
     symbol: str = "BTCUSDT"
-    use_full_depth_stream: bool = True  
     data_dir: str = "./data"
-    snapshot_interval_minutes: int = 10 
+    snapshot_interval_minutes: int = 10
     max_reconnect_attempts: int = 10
     reconnect_delay_base: float = 1.0
-    orderbook_snapshot_interval_sec: float = 0.1 
-    orderbook_levels: int = 50 
+    orderbook_snapshot_interval_sec: float = 0.05  # 20 Гц
+    orderbook_levels: int = 100
+    open_interest_fetch_interval_sec: float = 1.0  # каждую секунду
+    buffer_flush_interval_sec: float = 2.0
+    buffer_flush_max_records: int = 5000

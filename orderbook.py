@@ -45,7 +45,7 @@ class OrderBook:
     def is_synced(self) -> bool:
         return self._is_synced
 
-    def get_top_n(self, n: int = 50):
+    def get_top_n(self, n: int = 100):
         bids = list(self.bids.items())[:n]
         asks = list(self.asks.items())[:n]
         return bids, asks
