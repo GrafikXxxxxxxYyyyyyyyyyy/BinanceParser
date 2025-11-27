@@ -22,7 +22,7 @@ class BinanceFuturesCollector:
         self.running = False
         self.contract_size = 1.0
         self._book_synced = False
-        self._last_depth_exchange_ts = 0  # ← добавлено: timestamp последнего depth-сообщения
+        self._last_depth_exchange_ts = 0
 
     async def fetch_exchange_info(self):
         url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
@@ -92,7 +92,6 @@ class BinanceFuturesCollector:
             logger.debug(f"🔄 Ignoring stale update (u={msg['u']} <= last={self.book.last_update_id})")
             return
 
-        # Для @depth@100ms НЕТ проверки GAP!
         self.book.apply_diff(msg)
         self._process_depth_diff(msg)
 
@@ -100,7 +99,6 @@ class BinanceFuturesCollector:
         local_recv = int(time.time() * 1000)
         self._last_depth_exchange_ts = msg["E"]
         self.storage.buffer("depthDiffs", {
-            "U": msg["U"],
             "u": msg["u"],
             "bids": msg["b"],
             "asks": msg["a"],
@@ -125,6 +123,28 @@ class BinanceFuturesCollector:
                 return
             await asyncio.sleep(0.1)
         logger.error("💥 Sync failed after 5s — disabling orderbook snapshots")
+
+    async def _recover_from_wal(self):
+        """Восстанавливает данные из WAL-файлов при старте"""
+        logger.info("🔍 Recovering data from WAL files...")
+        recovered_count = 0
+        for stream_type in self.storage._schemas.keys():
+            from storage import WALLogger  # локальный импорт во избежание circular
+            wal_logger = WALLogger(self.cfg.data_dir, self.symbol, stream_type)
+            records = list(wal_logger.read_all())
+            if not records:
+                continue
+            logger.info(f"  → Found {len(records)} records in {stream_type} WAL")
+
+            for entry in records:
+                self.storage.buffer(stream_type, entry["data"])
+            recovered_count += len(records)
+
+        if recovered_count:
+            logger.info(f"✅ Recovered {recovered_count} records from WAL")
+            self.storage.flush_all()
+        else:
+            logger.info("📭 No WAL files found — clean start")
 
     async def periodic_orderbook_snapshot(self):
         logger.info("✅ OrderBook snapshot task STARTED (10Hz)")
@@ -306,6 +326,10 @@ class BinanceFuturesCollector:
     async def start(self):
         self.session = ClientSession()
         self.running = True
+
+        # 🔁 Восстановление из WAL — САМОЕ ПЕРВОЕ!
+        await self._recover_from_wal()
+
         await self.fetch_exchange_info()
         await self._proper_orderbook_init()
 
