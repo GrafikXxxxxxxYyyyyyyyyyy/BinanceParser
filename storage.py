@@ -20,7 +20,7 @@ class WALLogger:
 
     def open(self):
         if self._file is None:
-            self._file = open(self.wal_path, "a", buffering=1) 
+            self._file = open(self.wal_path, "a", buffering=1)
 
     def write(self, data: Dict[str, Any]):
         if self._file is None:
@@ -66,7 +66,8 @@ class DataStorage:
     def _define_schemas(self) -> Dict[str, pa.Schema]:
         return {
             "depthDiffs": pa.schema([
-                ("u", pa.int64()),  # ← УБРАНО "U" — его нет в @depth@100ms!
+                ("U", pa.int64()),
+                ("u", pa.int64()),
                 ("bids", pa.string()), ("asks", pa.string()),
                 ("exchange_ts", pa.int64()), ("local_recv_ts", pa.int64())
             ]),

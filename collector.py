@@ -77,19 +77,28 @@ class BinanceFuturesCollector:
             logger.error(f"Open interest fetch error: {e}")
 
     async def _depth_handler(self, msg: dict):
+        """
+        Обработка depth-обновлений для @depth@100ms.
+        Согласно документации Binance для агрегированных стримов:
+        - Принимаем первое событие с u >= lastUpdateId
+        - Последующие — просто по возрастанию u (монотонность гарантируется)
+        """
+        u = msg["u"]
+        U = msg["U"]
+
         if not self._book_synced:
-            if msg["u"] >= self.book.last_update_id:
-                logger.info(f"✅ Accepting first diff (u={msg['u']} >= snapshot lastUpdateId={self.book.last_update_id})")
+            if u >= self.book.last_update_id:
+                logger.info(f"✅ Accepting first diff for @100ms: U={U}, u={u}, last_id={self.book.last_update_id}")
                 self.book.apply_diff(msg)
                 self._book_synced = True
-                logger.info("🎯 OrderBook SYNCED ✅")
+                logger.info("🎯 OrderBook SYNCED (100ms mode) ✅")
                 self._process_depth_diff(msg)
             else:
-                logger.debug(f"🔄 Ignoring outdated diff: u={msg['u']} < {self.book.last_update_id}")
+                logger.debug(f"🔄 Ignoring outdated diff: u={u} < {self.book.last_update_id}")
             return
 
-        if msg["u"] <= self.book.last_update_id:
-            logger.debug(f"🔄 Ignoring stale update (u={msg['u']} <= last={self.book.last_update_id})")
+        if u <= self.book.last_update_id:
+            logger.debug(f"🔄 Ignoring stale update: u={u} <= last={self.book.last_update_id}")
             return
 
         self.book.apply_diff(msg)
@@ -99,6 +108,7 @@ class BinanceFuturesCollector:
         local_recv = int(time.time() * 1000)
         self._last_depth_exchange_ts = msg["E"]
         self.storage.buffer("depthDiffs", {
+            "U": msg["U"],
             "u": msg["u"],
             "bids": msg["b"],
             "asks": msg["a"],
@@ -129,7 +139,7 @@ class BinanceFuturesCollector:
         logger.info("🔍 Recovering data from WAL files...")
         recovered_count = 0
         for stream_type in self.storage._schemas.keys():
-            from storage import WALLogger  # локальный импорт во избежание circular
+            from storage import WALLogger
             wal_logger = WALLogger(self.cfg.data_dir, self.symbol, stream_type)
             records = list(wal_logger.read_all())
             if not records:
@@ -164,13 +174,13 @@ class BinanceFuturesCollector:
 
                     exchange_ts = self._last_depth_exchange_ts
                     if exchange_ts == 0:
-                        exchange_ts = int(time.time() * 1000)  
+                        exchange_ts = int(time.time() * 1000)
 
                     local_ts = int(time.time() * 1000)
                     bids, asks = self.book.get_top_n(self.cfg.orderbook_levels)
                     if bids and asks:
                         self.storage.buffer("orderbook_snapshots", {
-                            "exchange_ts": exchange_ts,   
+                            "exchange_ts": exchange_ts,
                             "local_recv_ts": local_ts,
                             "bids": bids,
                             "asks": asks,
@@ -315,9 +325,7 @@ class BinanceFuturesCollector:
         self.session = ClientSession()
         self.running = True
 
-        # 🔁 Восстановление из WAL — САМОЕ ПЕРВОЕ!
         await self._recover_from_wal()
-
         await self.fetch_exchange_info()
         await self._proper_orderbook_init()
 
