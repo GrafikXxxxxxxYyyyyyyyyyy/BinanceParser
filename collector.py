@@ -2,9 +2,7 @@ import asyncio
 import json
 import time
 import logging
-from collections import deque
 from typing import Dict, Any
-import pandas as pd  # требуется для storage
 from aiohttp import ClientSession
 from websockets import connect, ConnectionClosed
 from orderbook import OrderBook
@@ -12,6 +10,7 @@ from storage import DataStorage
 from config import CollectorConfig
 
 logger = logging.getLogger("Collector")
+
 
 class BinanceFuturesCollector:
     def __init__(self, config: CollectorConfig):
@@ -21,13 +20,9 @@ class BinanceFuturesCollector:
         self.storage = DataStorage(config.data_dir, self.symbol)
         self.session = None
         self.running = False
-        self.last_snapshot_ts = 0
-
-        self._depth_buffer = deque(maxlen=10000)  # ограниченный буфер
-        self._snapshot_received = False
+        self.contract_size = 1.0
         self._book_synced = False
-        self._depth_buffer_lock = asyncio.Lock()
-        self.contract_size = 1.0  # будет определено из exchangeInfo
+        self._last_depth_exchange_ts = 0  # ← добавлено: timestamp последнего depth-сообщения
 
     async def fetch_exchange_info(self):
         url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
@@ -36,7 +31,7 @@ class BinanceFuturesCollector:
             symbol_info = next(s for s in data["symbols"] if s["symbol"] == self.symbol)
             filters = {f["filterType"]: f for f in symbol_info["filters"]}
             lot_size = filters.get("LOT_SIZE", {})
-            self.contract_size = float(lot_size.get("minQty", 1.0))  # для BTCUSDT = 1
+            self.contract_size = float(lot_size.get("minQty", 1.0))
             logger.info(f"✅ Exchange info loaded. Contract size: {self.contract_size}")
 
     async def fetch_depth_snapshot(self):
@@ -48,10 +43,8 @@ class BinanceFuturesCollector:
             return await resp.json()
 
     async def fetch_open_interest(self):
-        # Получаем Open Interest
         oi_url = "https://fapi.binance.com/futures/data/openInterestHist"
         params = {"symbol": self.symbol, "period": "5m", "limit": 1}
-        # Получаем текущую цену (mark price)
         mark_url = f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={self.symbol}"
 
         try:
@@ -75,7 +68,8 @@ class BinanceFuturesCollector:
             value_usd = open_interest * mark_price * self.contract_size
 
             self.storage.buffer("openInterest", {
-                "timestamp": int(oi_item["timestamp"]),
+                "exchange_ts": int(oi_item["timestamp"]),
+                "local_recv_ts": int(time.time() * 1000),
                 "openInterest": open_interest,
                 "valueUSD": value_usd
             })
@@ -83,33 +77,28 @@ class BinanceFuturesCollector:
             logger.error(f"Open interest fetch error: {e}")
 
     async def _depth_handler(self, msg: dict):
-        if not self._snapshot_received:
-            async with self._depth_buffer_lock:
-                self._depth_buffer.append(msg)
-            return
-
         if not self._book_synced:
-            async with self._depth_buffer_lock:
-                if msg["U"] <= self.book.last_update_id + 1 and msg["u"] >= self.book.last_update_id:
-                    logger.info("✅ Valid first diff found! Applying buffer...")
-                    applying = False
-                    for buffered_msg in list(self._depth_buffer):
-                        if buffered_msg["U"] == msg["U"] and buffered_msg["u"] == msg["u"]:
-                            applying = True
-                        if applying:
-                            self.book.apply_diff(buffered_msg)
-                    self._depth_buffer.clear()
-                    self._book_synced = True
-                    logger.info("🎯 OrderBook IDEALLY SYNCED ✅")
-                else:
-                    self._depth_buffer.append(msg)
+            if msg["u"] >= self.book.last_update_id:
+                logger.info(f"✅ Accepting first diff (u={msg['u']} >= snapshot lastUpdateId={self.book.last_update_id})")
+                self.book.apply_diff(msg)
+                self._book_synced = True
+                logger.info("🎯 OrderBook SYNCED ✅")
+                self._process_depth_diff(msg)
+            else:
+                logger.debug(f"🔄 Ignoring outdated diff: u={msg['u']} < {self.book.last_update_id}")
             return
 
+        if msg["u"] <= self.book.last_update_id:
+            logger.debug(f"🔄 Ignoring stale update (u={msg['u']} <= last={self.book.last_update_id})")
+            return
+
+        # Для @depth@100ms НЕТ проверки GAP!
         self.book.apply_diff(msg)
         self._process_depth_diff(msg)
 
     def _process_depth_diff(self, msg: Dict[str, Any]):
         local_recv = int(time.time() * 1000)
+        self._last_depth_exchange_ts = msg["E"]
         self.storage.buffer("depthDiffs", {
             "U": msg["U"],
             "u": msg["u"],
@@ -120,62 +109,55 @@ class BinanceFuturesCollector:
         })
 
     async def _proper_orderbook_init(self):
-        logger.info("🔍 Starting IDEAL order book initialization...")
-        stream_url = f"wss://fstream.binance.com/ws/{self.symbol.lower()}@depth"
-        asyncio.create_task(self.websocket_reader(stream_url, self._depth_handler))
-        await asyncio.sleep(0.1)
+        logger.info("🔍 Starting order book initialization...")
         snapshot = await self.fetch_depth_snapshot()
         if not snapshot:
             raise RuntimeError("❌ Failed to get initial snapshot")
         self.book.apply_snapshot(snapshot)
-        self._snapshot_received = True
-        self.last_snapshot_ts = time.time()
         logger.info("📸 Snapshot received")
 
-        for _ in range(30):
+        stream_url = f"wss://fstream.binance.com/ws/{self.symbol.lower()}@depth@100ms"
+        asyncio.create_task(self.websocket_reader(stream_url, self._depth_handler))
+        await asyncio.sleep(0.1)
+
+        for _ in range(50):
             if self._book_synced:
                 return
             await asyncio.sleep(0.1)
-
-        async with self._depth_buffer_lock:
-            for msg in self._depth_buffer:
-                if msg["u"] >= self.book.last_update_id:
-                    logger.warning("⚠️ Best-effort sync applied")
-                    self.book.apply_diff(msg)
-                    self._book_synced = True
-                    self._depth_buffer.clear()
-                    return
-        logger.error("💥 Sync failed — disabling orderbook snapshots")
-
-    async def schedule_snapshot(self):
-        while self.running:
-            await asyncio.sleep(self.cfg.snapshot_interval_minutes * 60)
-            if self._book_synced:
-                snapshot = await self.fetch_depth_snapshot()
-                if snapshot:
-                    self.book.apply_snapshot(snapshot)
-                    self._snapshot_received = True
-                    self._book_synced = False
-                    self._depth_buffer.clear()
-                    self.last_snapshot_ts = time.time()
-                    logger.info("🔄 Periodic snapshot applied")
+        logger.error("💥 Sync failed after 5s — disabling orderbook snapshots")
 
     async def periodic_orderbook_snapshot(self):
-        logger.info("✅ OrderBook snapshot task STARTED (20Hz)")
+        logger.info("✅ OrderBook snapshot task STARTED (10Hz)")
+        consecutive_failures = 0
         while self.running:
             try:
-                if self._book_synced:
+                if not self._book_synced:
+                    consecutive_failures += 1
+                    if consecutive_failures == 1:
+                        logger.warning("⚠️ OrderBook NOT SYNCED — snapshots paused")
+                    elif consecutive_failures % 60 == 0:
+                        logger.warning("⚠️ OrderBook still NOT SYNCED — check depth stream!")
+                else:
+                    if consecutive_failures > 0:
+                        logger.info("✅ OrderBook SYNCED again — snapshots resumed")
+                        consecutive_failures = 0
+
+                    exchange_ts = self._last_depth_exchange_ts
+                    if exchange_ts == 0:
+                        exchange_ts = int(time.time() * 1000)  
+
                     local_ts = int(time.time() * 1000)
                     bids, asks = self.book.get_top_n(self.cfg.orderbook_levels)
                     if bids and asks:
                         self.storage.buffer("orderbook_snapshots", {
-                            "exchange_ts": local_ts,
+                            "exchange_ts": exchange_ts,   
                             "local_recv_ts": local_ts,
                             "bids": bids,
-                            "asks": asks
+                            "asks": asks,
+                            "lastUpdateId": self.book.last_update_id
                         })
             except Exception as e:
-                logger.error(f"💥 Orderbook snapshot error: {e}")
+                logger.error(f"💥 Orderbook snapshot error: {e}", exc_info=True)
             await asyncio.sleep(self.cfg.orderbook_snapshot_interval_sec)
 
     async def periodic_open_interest(self):
@@ -184,7 +166,6 @@ class BinanceFuturesCollector:
             await self.fetch_open_interest()
             await asyncio.sleep(self.cfg.open_interest_fetch_interval_sec)
 
-    # --- Processors ---
     def process_agg_trade(self, msg: Dict[str, Any]):
         self.storage.buffer("aggTrades", {
             "tradeId": msg["a"],
@@ -218,7 +199,7 @@ class BinanceFuturesCollector:
     def process_liquidation(self, msg: Dict[str, Any]):
         o = msg["o"]
         if o["s"] != self.symbol:
-            return  # фильтрация по символу!
+            return
         self.storage.buffer("liquidations", {
             "symbol": o["s"],
             "side": o["S"],
@@ -268,10 +249,30 @@ class BinanceFuturesCollector:
                 attempt += 1
                 delay = min(self.cfg.reconnect_delay_base * (2 ** (attempt - 1)), 60.0)
                 logger.warning(f"⚠️ WS error: {e}. Reconnect {attempt}/{self.cfg.max_reconnect_attempts} in {delay:.1f}s")
+                if "depth" in stream_url:
+                    logger.info("🔄 Depth stream disconnected. Reinitializing...")
+                    self._book_synced = False
+                    asyncio.create_task(self._reinit_orderbook_after_disconnect())
                 await asyncio.sleep(delay)
         logger.error(f"❌ Max reconnect attempts reached for {stream_url}")
 
-    # Async handlers
+    async def _reinit_orderbook_after_disconnect(self):
+        logger.info("🔄 Reinitializing order book...")
+        self._book_synced = False
+        for attempt in range(5):
+            try:
+                snapshot = await self.fetch_depth_snapshot()
+                if snapshot:
+                    self.book.apply_snapshot(snapshot)
+                    logger.info("📸 Snapshot refetched")
+                    stream_url = f"wss://fstream.binance.com/ws/{self.symbol.lower()}@depth@100ms"
+                    asyncio.create_task(self.websocket_reader(stream_url, self._depth_handler))
+                    return
+            except Exception as e:
+                logger.warning(f"⚠️ Snapshot attempt {attempt+1}/5 failed: {e}")
+            await asyncio.sleep(1)
+        logger.critical("❌ Reinit failed after 5 attempts")
+
     async def handle_agg_trade(self, msg): self.process_agg_trade(msg)
     async def handle_raw_trade(self, msg): self.process_raw_trade(msg)
     async def handle_mark_price(self, msg): self.process_mark_price(msg)
@@ -283,12 +284,29 @@ class BinanceFuturesCollector:
         while self.running:
             await asyncio.sleep(self.cfg.buffer_flush_interval_sec)
             self.storage.flush_all()
+            for stream_type, buffer in list(self.storage._buffers.items()):
+                if len(buffer) >= self.cfg.buffer_flush_max_records:
+                    logger.info(f"📤 Forced flush for '{stream_type}' (size: {len(buffer)})")
+                    try:
+                        self.storage.flush_stream(stream_type)
+                    except Exception as e:
+                        logger.error(f"💥 Flush failed for '{stream_type}': {e}")
+
+    async def safe_task(self, coro, task_name: str):
+        while self.running:
+            try:
+                await coro
+            except asyncio.CancelledError:
+                logger.info(f"⏹️ Task '{task_name}' cancelled.")
+                break
+            except Exception as e:
+                logger.critical(f"💥 CRITICAL: Task '{task_name}' crashed! Restarting in 1s. Error: {e}", exc_info=True)
+                await asyncio.sleep(1)
 
     async def start(self):
         self.session = ClientSession()
         self.running = True
         await self.fetch_exchange_info()
-
         await self._proper_orderbook_init()
 
         streams = [
@@ -301,18 +319,20 @@ class BinanceFuturesCollector:
         ]
 
         tasks = [
-            self.schedule_snapshot(),
-            self.periodic_orderbook_snapshot(),
-            self.periodic_open_interest(),
-            self.periodic_flush(),
+            self.safe_task(self.periodic_orderbook_snapshot(), "orderbook_snapshot"),
+            self.safe_task(self.periodic_open_interest(), "open_interest"),
+            self.safe_task(self.periodic_flush(), "periodic_flush"),
         ]
-        tasks += [self.websocket_reader(url, handler) for url, handler in streams]
+        tasks += [
+            self.safe_task(self.websocket_reader(url, handler), f"ws_{i}")
+            for i, (url, handler) in enumerate(streams)
+        ]
 
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*tasks)
 
     async def stop(self):
         self.running = False
         if self.session:
             await self.session.close()
         self.storage.close_all()
-        logger.info("⏹️  Collector stopped and data flushed.")
+        logger.info("⏹️ Collector stopped and data flushed.")

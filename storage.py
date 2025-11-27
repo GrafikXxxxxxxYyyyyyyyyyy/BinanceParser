@@ -7,14 +7,13 @@ import pyarrow.parquet as pq
 from datetime import datetime, timezone
 from typing import Dict, Any
 
-# Настройка логгера
 logger = logging.getLogger("Storage")
+
 
 class DataStorage:
     def __init__(self, data_dir: str, symbol: str):
         self.data_dir = data_dir
         self.symbol = symbol
-        os.makedirs(data_dir, exist_ok=True)
         self._current_hour: Dict[str, str] = {}
         self._buffers: Dict[str, list] = {}
         self._writers: Dict[str, pq.ParquetWriter] = {}
@@ -29,7 +28,8 @@ class DataStorage:
             ]),
             "orderbook_snapshots": pa.schema([
                 ("exchange_ts", pa.int64()), ("local_recv_ts", pa.int64()),
-                ("bids", pa.string()), ("asks", pa.string())
+                ("bids", pa.string()), ("asks", pa.string()),
+                ("lastUpdateId", pa.int64())
             ]),
             "aggTrades": pa.schema([
                 ("tradeId", pa.int64()), ("price", pa.float64()), ("qty", pa.float64()),
@@ -58,7 +58,8 @@ class DataStorage:
                 ("exchange_ts", pa.int64()), ("local_recv_ts", pa.int64())
             ]),
             "openInterest": pa.schema([
-                ("timestamp", pa.int64()), ("openInterest", pa.float64()), ("valueUSD", pa.float64())
+                ("openInterest", pa.float64()), ("valueUSD", pa.float64()),
+                ("exchange_ts", pa.int64()), ("local_recv_ts", pa.int64())
             ])
         }
 
@@ -66,7 +67,10 @@ class DataStorage:
         return datetime.now(timezone.utc).strftime("%Y%m%d_%H")
 
     def _get_path(self, stream_type: str, hour: str) -> str:
-        return os.path.join(self.data_dir, f"{self.symbol}_{stream_type}_{hour}.parquet")
+        # Создаём поддиректорию для каждого типа данных
+        stream_dir = os.path.join(self.data_dir, stream_type)
+        os.makedirs(stream_dir, exist_ok=True)
+        return os.path.join(stream_dir, f"{self.symbol}_{stream_type}_{hour}.parquet")
 
     def buffer(self, stream_type: str, data: Dict[str, Any]):
         if stream_type not in self._buffers:
@@ -86,13 +90,17 @@ class DataStorage:
             self._current_hour[stream_type] = current_hour
             path = self._get_path(stream_type, current_hour)
             self._writers[stream_type] = pq.ParquetWriter(
-                path, self._schemas[stream_type]
+                path, self._schemas[stream_type], compression='zstd'
             )
 
     def _close_writer(self, stream_type: str):
         if stream_type in self._writers:
-            self._writers[stream_type].close()
-            del self._writers[stream_type]
+            try:
+                self._writers[stream_type].close()
+            except Exception as e:
+                logger.warning(f"Error closing writer for {stream_type}: {e}")
+            finally:
+                del self._writers[stream_type]
 
     def flush_stream(self, stream_type: str):
         buffer = self._buffers.get(stream_type)
@@ -101,10 +109,14 @@ class DataStorage:
         try:
             self._rotate_writer_if_needed(stream_type)
             df = pd.DataFrame(buffer)
-            table = pa.Table.from_pandas(df, schema=self._schemas[stream_type])
+            schema = self._schemas[stream_type]
+            for field in schema:
+                if field.name not in df.columns:
+                    df[field.name] = None
+            table = pa.Table.from_pandas(df, schema=schema, preserve_index=False)
             self._writers[stream_type].write_table(table)
         except Exception as e:
-            logger.error(f"Flush error for {stream_type}: {e}")
+            logger.error(f"Flush error for {stream_type}: {e}", exc_info=True)
         finally:
             self._buffers[stream_type].clear()
 
