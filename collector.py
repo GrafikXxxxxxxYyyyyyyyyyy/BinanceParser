@@ -23,6 +23,7 @@ class BinanceFuturesCollector:
         self.contract_size = 1.0
         self._book_synced = False
         self._last_depth_exchange_ts = 0
+        self._last_snapshot_local_ts = 0  # время последнего снапшота (в ms)
 
     async def fetch_exchange_info(self):
         url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
@@ -43,19 +44,18 @@ class BinanceFuturesCollector:
             return await resp.json()
 
     async def fetch_open_interest(self):
-        oi_url = "https://fapi.binance.com/futures/data/openInterestHist"
-        params = {"symbol": self.symbol, "period": "5m", "limit": 1}
+        """Получает текущий открытый интерес через правильный эндпоинт."""
+        url = "https://fapi.binance.com/fapi/v1/openInterest"
+        params = {"symbol": self.symbol}
         mark_url = f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={self.symbol}"
 
         try:
-            async with self.session.get(oi_url, params=params) as oi_resp:
+            async with self.session.get(url, params=params) as oi_resp:
                 if oi_resp.status != 200:
                     logger.warning(f"OI fetch failed: {oi_resp.status}")
                     return
                 oi_data = await oi_resp.json()
-                if not oi_data:
-                    return
-                oi_item = oi_data[0]
+                open_interest = float(oi_data["openInterest"])
 
             async with self.session.get(mark_url) as mark_resp:
                 if mark_resp.status != 200:
@@ -64,31 +64,26 @@ class BinanceFuturesCollector:
                 mark_data = await mark_resp.json()
                 mark_price = float(mark_data.get("markPrice", 0))
 
-            open_interest = float(oi_item["sumOpenInterest"])
             value_usd = open_interest * mark_price * self.contract_size
 
             self.storage.buffer("openInterest", {
-                "exchange_ts": int(oi_item["timestamp"]),
+                "exchange_ts": int(time.time() * 1000),
                 "local_recv_ts": int(time.time() * 1000),
                 "openInterest": open_interest,
                 "valueUSD": value_usd
             })
         except Exception as e:
-            logger.error(f"Open interest fetch error: {e}")
+            logger.error(f"Open interest fetch error: {e}", exc_info=True)
 
     def _trigger_orderbook_resync(self):
-        if not self.running or self._book_synced:
+        """Запускает ресинхронизацию ТОЛЬКО если стакан был синхронизирован."""
+        if not self.running or not self._book_synced:
             return
         logger.info("🔄 Triggering OrderBook resync due to desync")
         self._book_synced = False
         asyncio.create_task(self._reinit_orderbook_after_disconnect())
 
     async def _depth_handler(self, msg: dict):
-        """
-        Обработка @depth@100ms.
-        - Инициализация: принимаем первое сообщение с u >= lastUpdateId.
-        - После синхронизации: НЕ проверяем непрерывность — это агрегированный поток!
-        """
         if not self._book_synced:
             if msg["u"] >= self.book.last_update_id:
                 logger.info(f"✅ OrderBook SYNCED (@100ms) with u={msg['u']}")
@@ -99,13 +94,13 @@ class BinanceFuturesCollector:
                 logger.debug(f"🔄 Skipping outdated diff: u={msg['u']} < {self.book.last_update_id}")
             return
 
-        # После синхронизации — просто применяем, без проверки U
         self.book.apply_diff(msg)
         self._process_depth_diff(msg)
 
     def _process_depth_diff(self, msg: Dict[str, Any]):
         local_recv = int(time.time() * 1000)
         self._last_depth_exchange_ts = msg["E"]
+        # Записываем diff
         self.storage.buffer("depthDiffs", {
             "U": msg["U"],
             "u": msg["u"],
@@ -114,6 +109,34 @@ class BinanceFuturesCollector:
             "exchange_ts": msg["E"],
             "local_recv_ts": local_recv
         })
+
+        # === TRIGGER-BASED SNAPSHOT: при обновлении стакана ===
+        if self._book_synced:
+            self._try_save_snapshot(exchange_ts=msg["E"], local_ts=local_recv)
+
+    def _try_save_snapshot(self, exchange_ts: int, local_ts: int):
+        """Потокобезопасное сохранение снапшота с проверкой интервала."""
+        interval_ms = int(self.cfg.orderbook_snapshot_interval_sec * 1000)
+        if local_ts - self._last_snapshot_local_ts >= interval_ms:
+            self._save_orderbook_snapshot(exchange_ts, local_ts)
+
+    def _save_orderbook_snapshot(self, exchange_ts: int, local_ts: int):
+        """Сохраняет снапшот стакана в storage."""
+        try:
+            bids, asks = self.book.get_top_n(self.cfg.orderbook_levels)
+            if not bids or not asks:
+                return
+            self.storage.buffer("orderbook_snapshots", {
+                "exchange_ts": exchange_ts,
+                "local_recv_ts": local_ts,
+                "bids": bids,
+                "asks": asks,
+                "lastUpdateId": self.book.last_update_id
+            })
+            self._last_snapshot_local_ts = local_ts  # обновляем только при успехе
+            logger.debug(f"📸 Saved orderbook snapshot @ {exchange_ts}")
+        except Exception as e:
+            logger.error(f"💥 Failed to save orderbook snapshot: {e}", exc_info=True)
 
     async def _proper_orderbook_init(self):
         logger.info("🔍 Starting order book initialization (@depth@100ms)...")
@@ -142,7 +165,6 @@ class BinanceFuturesCollector:
             if not records:
                 continue
             logger.info(f"  → Found {len(records)} records in {stream_type} WAL")
-
             for entry in records:
                 self.storage.buffer(stream_type, entry["data"])
             recovered_count += len(records)
@@ -154,40 +176,19 @@ class BinanceFuturesCollector:
             logger.info("📭 No WAL files found — clean start")
 
     async def periodic_orderbook_snapshot(self):
-        logger.info("✅ OrderBook snapshot task STARTED (10Hz)")
-        consecutive_failures = 0
+        """FALLBACK: сохраняет снапшот каждые N мс, если стакан не обновлялся."""
+        logger.info("✅ Periodic orderbook snapshot task STARTED (fallback)")
         while self.running:
             try:
-                if not self._book_synced:
-                    consecutive_failures += 1
-                    if consecutive_failures == 1:
-                        logger.warning("⚠️ OrderBook NOT SYNCED — snapshots paused")
-                    elif consecutive_failures % 120 == 0:  # каждые 12 сек
-                        logger.warning("⚠️ OrderBook still NOT SYNCED — check depth stream!")
-                        self._trigger_orderbook_resync()
-                else:
-                    if consecutive_failures > 0:
-                        logger.info("✅ OrderBook SYNCED again — snapshots resumed")
-                        consecutive_failures = 0
-
-                    # Защита: не писать, если нет временной метки или не синхронизирован
-                    if not self._book_synced or self._last_depth_exchange_ts == 0:
-                        await asyncio.sleep(self.cfg.orderbook_snapshot_interval_sec)
-                        continue
-
-                    exchange_ts = self._last_depth_exchange_ts
+                if self._book_synced and self._last_depth_exchange_ts != 0:
                     local_ts = int(time.time() * 1000)
-                    bids, asks = self.book.get_top_n(self.cfg.orderbook_levels)
-                    if bids and asks:
-                        self.storage.buffer("orderbook_snapshots", {
-                            "exchange_ts": exchange_ts,
-                            "local_recv_ts": local_ts,
-                            "bids": bids,
-                            "asks": asks,
-                            "lastUpdateId": self.book.last_update_id
-                        })
+                    # Используем последнее известное exchange_ts от биржи
+                    self._try_save_snapshot(
+                        exchange_ts=self._last_depth_exchange_ts,
+                        local_ts=local_ts
+                    )
             except Exception as e:
-                logger.error(f"💥 Orderbook snapshot error: {e}", exc_info=True)
+                logger.error(f"💥 Periodic snapshot error: {e}", exc_info=True)
             await asyncio.sleep(self.cfg.orderbook_snapshot_interval_sec)
 
     async def periodic_open_interest(self):
@@ -293,7 +294,6 @@ class BinanceFuturesCollector:
         logger.error("❌ Reinit failed after 5 attempts — continuing without orderbook")
 
     async def validate_orderbook(self):
-        """Validates local orderbook against REST snapshot every 30s"""
         logger.info("✅ OrderBook validator STARTED (every 30s)")
         while self.running:
             try:
