@@ -20,7 +20,7 @@ class WALLogger:
 
     def open(self):
         if self._file is None:
-            self._file = open(self._wal_path, "a", buffering=1)  # line-buffered
+            self._file = open(self.wal_path, "a", buffering=1) 
 
     def write(self, data: Dict[str, Any]):
         if self._file is None:
@@ -90,11 +90,6 @@ class DataStorage:
             "liquidations": pa.schema([
                 ("symbol", pa.string()), ("side", pa.string()), ("price", pa.float64()),
                 ("qty", pa.float64()), ("exchange_ts", pa.int64()), ("local_recv_ts", pa.int64())
-            ]),
-            "klines_1s": pa.schema([
-                ("open", pa.float64()), ("high", pa.float64()), ("low", pa.float64()),
-                ("close", pa.float64()), ("volume", pa.float64()), ("quoteVolume", pa.float64()),
-                ("exchange_ts", pa.int64()), ("local_recv_ts", pa.int64())
             ]),
             "bookTicker": pa.schema([
                 ("bestBid", pa.float64()), ("bestBidQty", pa.float64()),

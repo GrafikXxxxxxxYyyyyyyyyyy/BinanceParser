@@ -229,17 +229,6 @@ class BinanceFuturesCollector:
             "local_recv_ts": int(time.time() * 1000)
         })
 
-    def process_kline(self, msg: Dict[str, Any]):
-        k = msg["k"]
-        if not k["x"]:
-            return
-        self.storage.buffer("klines_1s", {
-            "open": float(k["o"]), "high": float(k["h"]), "low": float(k["l"]), "close": float(k["c"]),
-            "volume": float(k["v"]), "quoteVolume": float(k["q"]),
-            "exchange_ts": k["t"],
-            "local_recv_ts": int(time.time() * 1000)
-        })
-
     def process_book_ticker(self, msg: Dict[str, Any]):
         self.storage.buffer("bookTicker", {
             "bestBid": float(msg["b"]), "bestBidQty": float(msg["B"]),
@@ -297,7 +286,6 @@ class BinanceFuturesCollector:
     async def handle_raw_trade(self, msg): self.process_raw_trade(msg)
     async def handle_mark_price(self, msg): self.process_mark_price(msg)
     async def handle_liquidation(self, msg): self.process_liquidation(msg)
-    async def handle_kline(self, msg): self.process_kline(msg)
     async def handle_book_ticker(self, msg): self.process_book_ticker(msg)
 
     async def periodic_flush(self):
@@ -338,7 +326,6 @@ class BinanceFuturesCollector:
             (f"wss://fstream.binance.com/ws/{self.symbol.lower()}@trade", self.handle_raw_trade),
             (f"wss://fstream.binance.com/ws/{self.symbol.lower()}@markPrice@1s", self.handle_mark_price),
             ("wss://fstream.binance.com/ws/!forceOrder@arr", self.handle_liquidation),
-            (f"wss://fstream.binance.com/ws/{self.symbol.lower()}@kline_1s", self.handle_kline),
             (f"wss://fstream.binance.com/ws/{self.symbol.lower()}@bookTicker", self.handle_book_ticker),
         ]
 
