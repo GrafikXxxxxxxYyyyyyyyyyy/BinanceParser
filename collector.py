@@ -357,9 +357,13 @@ class BinanceFuturesCollector:
                     except Exception as e:
                         logger.error(f"💥 Flush failed for '{stream_type}': {e}")
 
-    async def safe_task(self, coro, task_name: str):
+    async def safe_task(self, task_factory, task_name: str):
+        """Запускает задачу, созданную через task_factory(), и перезапускает при падении."""
         while self.running:
             try:
+                coro = task_factory()
+                if not asyncio.iscoroutine(coro):
+                    raise ValueError(f"task_factory for '{task_name}' did not return a coroutine")
                 await coro
             except asyncio.CancelledError:
                 logger.info(f"⏹️ Task '{task_name}' cancelled.")
@@ -384,14 +388,16 @@ class BinanceFuturesCollector:
             (f"wss://fstream.binance.com/ws/{self.symbol.lower()}@bookTicker", self.handle_book_ticker),
         ]
 
+        from functools import partial
+
         tasks = [
-            self.safe_task(self.periodic_orderbook_snapshot(), "orderbook_snapshot"),
-            self.safe_task(self.periodic_open_interest(), "open_interest"),
-            self.safe_task(self.periodic_flush(), "periodic_flush"),
-            self.safe_task(self.validate_orderbook(), "orderbook_validator"),
+            self.safe_task(self.periodic_orderbook_snapshot, "orderbook_snapshot"),
+            self.safe_task(self.periodic_open_interest, "open_interest"),
+            self.safe_task(self.periodic_flush, "periodic_flush"),
+            self.safe_task(self.validate_orderbook, "orderbook_validator"),
         ]
         tasks += [
-            self.safe_task(self.websocket_reader(url, handler), f"ws_{i}")
+            self.safe_task(partial(self.websocket_reader, url, handler), f"ws_{i}")
             for i, (url, handler) in enumerate(streams)
         ]
 
@@ -399,7 +405,7 @@ class BinanceFuturesCollector:
 
     async def stop(self):
         self.running = False
-        if self.session:
+        if self.session and not self.session.closed:
             await self.session.close()
         self.storage.close_all()
         logger.info("⏹️ Collector stopped and data flushed.")
