@@ -24,6 +24,7 @@ class BinanceFuturesCollector:
         self._book_synced = False
         self._last_depth_exchange_ts = 0
         self._last_snapshot_local_ts = 0  # время последнего снапшота (в ms)
+        self._reinit_in_progress = False  # 🔒 защита от параллельных восстановлений
 
     async def fetch_exchange_info(self):
         url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
@@ -38,10 +39,14 @@ class BinanceFuturesCollector:
     async def fetch_depth_snapshot(self):
         url = f"https://fapi.binance.com/fapi/v1/depth?symbol={self.symbol}&limit=1000"
         async with self.session.get(url) as resp:
-            if resp.status != 200:
+            if resp.status == 200:
+                return await resp.json()
+            elif resp.status in (418, 429):
+                logger.warning(f"⚠️ Rate limit hit (HTTP {resp.status}). IP likely banned. Pausing reinit.")
+                return None  # не пытаемся повторять
+            else:
                 logger.error(f"❌ Failed to fetch snapshot: {resp.status}")
                 return None
-            return await resp.json()
 
     async def fetch_open_interest(self):
         """Получает текущий открытый интерес через правильный эндпоинт."""
@@ -76,67 +81,53 @@ class BinanceFuturesCollector:
             logger.error(f"Open interest fetch error: {e}", exc_info=True)
 
     def _trigger_orderbook_resync(self):
-        """Запускает ресинхронизацию ТОЛЬКО если стакан был синхронизирован."""
-        if not self.running or not self._book_synced:
+        """Запускает ресинхронизацию ТОЛЬКО если стакан был синхронизирован и восстановление не идёт."""
+        if not self.running or not self._book_synced or self._reinit_in_progress:
             return
         logger.info("🔄 Triggering OrderBook resync due to desync")
         self._book_synced = False
-        asyncio.create_task(self._reinit_orderbook_after_disconnect())
+        asyncio.create_task(self._delayed_reinit_orderbook())
 
-    async def _depth_handler(self, msg: dict):
-        if not self._book_synced:
-            if msg["u"] >= self.book.last_update_id:
-                logger.info(f"✅ OrderBook SYNCED (@100ms) with u={msg['u']}")
-                self.book.apply_diff(msg)
-                self._book_synced = True
-                self._process_depth_diff(msg)
-            else:
-                logger.debug(f"🔄 Skipping outdated diff: u={msg['u']} < {self.book.last_update_id}")
+    async def _delayed_reinit_orderbook(self):
+        """Откладывает реинициализацию на 0.5 сек, чтобы избежать шторма запросов."""
+        if self._reinit_in_progress:
+            return
+        self._reinit_in_progress = True
+        try:
+            await asyncio.sleep(0.5)  # дать сети стабилизироваться
+            await self._reinit_orderbook_after_disconnect()
+        finally:
+            self._reinit_in_progress = False
+
+    async def _reinit_orderbook_after_disconnect(self):
+        """Пытается восстановить стакан. Вызывается только один раз за раз."""
+        if not self.running:
             return
 
-        self.book.apply_diff(msg)
-        self._process_depth_diff(msg)
+        logger.info("🔄 OrderBook reinitialization STARTED")
+        self._book_synced = False
 
-    def _process_depth_diff(self, msg: Dict[str, Any]):
-        local_recv = int(time.time() * 1000)
-        self._last_depth_exchange_ts = msg["E"]
-        # Записываем diff
-        self.storage.buffer("depthDiffs", {
-            "U": msg["U"],
-            "u": msg["u"],
-            "bids": msg["b"],
-            "asks": msg["a"],
-            "exchange_ts": msg["E"],
-            "local_recv_ts": local_recv
-        })
-
-        # === TRIGGER-BASED SNAPSHOT: при обновлении стакана ===
-        if self._book_synced:
-            self._try_save_snapshot(exchange_ts=msg["E"], local_ts=local_recv)
-
-    def _try_save_snapshot(self, exchange_ts: int, local_ts: int):
-        """Потокобезопасное сохранение снапшота с проверкой интервала."""
-        interval_ms = int(self.cfg.orderbook_snapshot_interval_sec * 1000)
-        if local_ts - self._last_snapshot_local_ts >= interval_ms:
-            self._save_orderbook_snapshot(exchange_ts, local_ts)
-
-    def _save_orderbook_snapshot(self, exchange_ts: int, local_ts: int):
-        """Сохраняет снапшот стакана в storage."""
-        try:
-            bids, asks = self.book.get_top_n(self.cfg.orderbook_levels)
-            if not bids or not asks:
+        base_delay = 2.0
+        for attempt in range(5):
+            if not self.running:
                 return
-            self.storage.buffer("orderbook_snapshots", {
-                "exchange_ts": exchange_ts,
-                "local_recv_ts": local_ts,
-                "bids": bids,
-                "asks": asks,
-                "lastUpdateId": self.book.last_update_id
-            })
-            self._last_snapshot_local_ts = local_ts  # обновляем только при успехе
-            logger.debug(f"📸 Saved orderbook snapshot @ {exchange_ts}")
-        except Exception as e:
-            logger.error(f"💥 Failed to save orderbook snapshot: {e}", exc_info=True)
+            try:
+                snapshot = await self.fetch_depth_snapshot()
+                if snapshot:
+                    self.book.apply_snapshot(snapshot)
+                    logger.info(f"📸 Snapshot refetched (lastUpdateId={self.book.last_update_id})")
+                    stream_url = f"wss://fstream.binance.com/ws/{self.symbol.lower()}@depth@100ms"
+                    asyncio.create_task(self.websocket_reader(stream_url, self._depth_handler))
+                    return
+            except Exception as e:
+                logger.warning(f"⚠️ Snapshot attempt {attempt+1}/5 failed: {e}")
+            
+            # Экспоненциальная задержка
+            delay = min(base_delay * (2 ** attempt), 60.0)
+            logger.info(f"  ⏳ Waiting {delay:.1f}s before next snapshot attempt...")
+            await asyncio.sleep(delay)
+
+        logger.error("❌ Reinit failed after 5 attempts — continuing without orderbook")
 
     async def _proper_orderbook_init(self):
         logger.info("🔍 Starting order book initialization (@depth@100ms)...")
@@ -182,7 +173,6 @@ class BinanceFuturesCollector:
             try:
                 if self._book_synced and self._last_depth_exchange_ts != 0:
                     local_ts = int(time.time() * 1000)
-                    # Используем последнее известное exchange_ts от биржи
                     self._try_save_snapshot(
                         exchange_ts=self._last_depth_exchange_ts,
                         local_ts=local_ts
@@ -196,6 +186,57 @@ class BinanceFuturesCollector:
         while self.running:
             await self.fetch_open_interest()
             await asyncio.sleep(self.cfg.open_interest_fetch_interval_sec)
+
+    def _process_depth_diff(self, msg: Dict[str, Any]):
+        local_recv = int(time.time() * 1000)
+        self._last_depth_exchange_ts = msg["E"]
+        self.storage.buffer("depthDiffs", {
+            "U": msg["U"],
+            "u": msg["u"],
+            "bids": msg["b"],
+            "asks": msg["a"],
+            "exchange_ts": msg["E"],
+            "local_recv_ts": local_recv
+        })
+
+        if self._book_synced:
+            self._try_save_snapshot(exchange_ts=msg["E"], local_ts=local_recv)
+
+    def _try_save_snapshot(self, exchange_ts: int, local_ts: int):
+        interval_ms = int(self.cfg.orderbook_snapshot_interval_sec * 1000)
+        if local_ts - self._last_snapshot_local_ts >= interval_ms:
+            self._save_orderbook_snapshot(exchange_ts, local_ts)
+
+    def _save_orderbook_snapshot(self, exchange_ts: int, local_ts: int):
+        try:
+            bids, asks = self.book.get_top_n(self.cfg.orderbook_levels)
+            if not bids or not asks:
+                return
+            self.storage.buffer("orderbook_snapshots", {
+                "exchange_ts": exchange_ts,
+                "local_recv_ts": local_ts,
+                "bids": bids,
+                "asks": asks,
+                "lastUpdateId": self.book.last_update_id
+            })
+            self._last_snapshot_local_ts = local_ts
+            logger.debug(f"📸 Saved orderbook snapshot @ {exchange_ts}")
+        except Exception as e:
+            logger.error(f"💥 Failed to save orderbook snapshot: {e}", exc_info=True)
+
+    async def _depth_handler(self, msg: dict):
+        if not self._book_synced:
+            if msg["u"] >= self.book.last_update_id:
+                logger.info(f"✅ OrderBook SYNCED (@100ms) with u={msg['u']}")
+                self.book.apply_diff(msg)
+                self._book_synced = True
+                self._process_depth_diff(msg)
+            else:
+                logger.debug(f"🔄 Skipping outdated diff: u={msg['u']} < {self.book.last_update_id}")
+            return
+
+        self.book.apply_diff(msg)
+        self._process_depth_diff(msg)
 
     def process_agg_trade(self, msg: Dict[str, Any]):
         self.storage.buffer("aggTrades", {
@@ -271,27 +312,9 @@ class BinanceFuturesCollector:
                 logger.warning(f"⚠️ WS error: {e}. Reconnect {attempt}/{self.cfg.max_reconnect_attempts} in {delay:.1f}s")
                 if "depth" in stream_url:
                     logger.info("🔄 Depth stream disconnected. Reinitializing...")
-                    self._book_synced = False
-                    asyncio.create_task(self._reinit_orderbook_after_disconnect())
+                    self._trigger_orderbook_resync()
                 await asyncio.sleep(delay)
         logger.error(f"❌ Max reconnect attempts reached for {stream_url}")
-
-    async def _reinit_orderbook_after_disconnect(self):
-        logger.info("🔄 OrderBook reinitialization STARTED")
-        self._book_synced = False
-        for attempt in range(5):
-            try:
-                snapshot = await self.fetch_depth_snapshot()
-                if snapshot:
-                    self.book.apply_snapshot(snapshot)
-                    logger.info(f"📸 Snapshot refetched (lastUpdateId={self.book.last_update_id})")
-                    stream_url = f"wss://fstream.binance.com/ws/{self.symbol.lower()}@depth@100ms"
-                    asyncio.create_task(self.websocket_reader(stream_url, self._depth_handler))
-                    return
-            except Exception as e:
-                logger.warning(f"⚠️ Snapshot attempt {attempt+1}/5 failed: {e}")
-            await asyncio.sleep(1)
-        logger.error("❌ Reinit failed after 5 attempts — continuing without orderbook")
 
     async def validate_orderbook(self):
         logger.info("✅ OrderBook validator STARTED (every 30s)")
@@ -337,7 +360,7 @@ class BinanceFuturesCollector:
                     logger.debug("⏸️ Skipping validation — orderbook not synced")
             except Exception as e:
                 logger.error(f"💥 OrderBook validation error: {e}", exc_info=True)
-            await asyncio.sleep(30)
+            await asyncio.sleep(300)
 
     async def handle_agg_trade(self, msg): self.process_agg_trade(msg)
     async def handle_raw_trade(self, msg): self.process_raw_trade(msg)
@@ -358,7 +381,6 @@ class BinanceFuturesCollector:
                         logger.error(f"💥 Flush failed for '{stream_type}': {e}")
 
     async def safe_task(self, task_factory, task_name: str):
-        """Запускает задачу, созданную через task_factory(), и перезапускает при падении."""
         while self.running:
             try:
                 coro = task_factory()
