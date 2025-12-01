@@ -317,7 +317,7 @@ class BinanceFuturesCollector:
         logger.error(f"❌ Max reconnect attempts reached for {stream_url}")
 
     async def validate_orderbook(self):
-        logger.info("✅ OrderBook validator STARTED (every 30s)")
+        logger.info("✅ OrderBook validator STARTED (every 300s)")
         while self.running:
             try:
                 if self._book_synced:
