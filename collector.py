@@ -369,7 +369,6 @@ class BinanceFuturesCollector:
     async def handle_book_ticker(self, msg): self.process_book_ticker(msg)
 
     async def periodic_flush(self):
-        logger.critical("!!! periodic_flush ENTERED !!!")
         while self.running:
             await asyncio.sleep(self.cfg.buffer_flush_interval_sec)
             logger.debug("🔄 Periodic flush triggered")
