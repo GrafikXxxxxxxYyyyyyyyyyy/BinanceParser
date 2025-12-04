@@ -24,10 +24,18 @@ class WALLogger:
 
     def write(self, data: Dict[str, Any]):
         if self._file is None:
-            self.open()
-        entry = {"stream": self.stream_type, "data": data}
-        self._file.write(json.dumps(entry, separators=(',', ':')) + "\n")
-        self._file.flush()
+            try:
+                self.open()
+            except OSError as e:
+                logger.error(f"❌ Failed to open WAL file {self.wal_path}: {e}")
+                return 
+        try:
+            entry = {"stream": self.stream_type, "data": data}
+            self._file.write(json.dumps(entry, separators=(',', ':')) + "\n")
+            self._file.flush()
+        except OSError as e:
+            logger.error(f"❌ WAL write failed for {self.wal_path}: {e}")
+            self._file = None
 
     def close(self):
         if self._file:
@@ -50,7 +58,16 @@ class WALLogger:
     def clear(self):
         """Удаляет WAL после успешной записи в Parquet"""
         if os.path.exists(self.wal_path):
-            os.remove(self.wal_path)
+            try:
+                file_size = os.path.getsize(self.wal_path)
+                os.remove(self.wal_path)
+                logger.debug(f"🗑️ WAL cleared: {self.wal_path} (size: {file_size / (1024*1024):.2f} MB)")
+            except Exception as e:
+                logger.error(f"❌ Failed to remove WAL {self.wal_path}: {e}")
+
+        if self._file:
+            self._file.close()
+            self._file = None
 
 
 class DataStorage:
@@ -149,6 +166,7 @@ class DataStorage:
         buffer = self._buffers.get(stream_type)
         if not buffer:
             return
+        logger.debug(f"📤 Flushing {len(buffer)} records for stream '{stream_type}'")
         try:
             self._rotate_writer_if_needed(stream_type)
             df = pd.DataFrame(buffer)
@@ -160,7 +178,7 @@ class DataStorage:
             self._writers[stream_type].write_table(table)
 
             if stream_type in self._wal_loggers:
-                self._wal_loggers[stream_type].clear()
+                self._wal_loggers[stream_type].clear() 
 
         except Exception as e:
             logger.error(f"Flush error for {stream_type}: {e}", exc_info=True)
