@@ -22,7 +22,7 @@ async def main():
         symbol=symbol,
         data_dir=f"./data_{symbol}",
         orderbook_levels=1000,
-        orderbook_snapshot_interval_sec=0.5,
+        orderbook_snapshot_interval_sec=0.2,
         open_interest_fetch_interval_sec=1.0,
         buffer_flush_interval_sec=2.0
     )
