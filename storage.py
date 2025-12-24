@@ -81,26 +81,20 @@ class DataStorage:
         self._schemas = self._define_schemas()
 
     def _define_schemas(self) -> Dict[str, pa.Schema]:
+        # Схема для 1000 уровней стакана — плоская структура
+        orderbook_fields = [
+            ("exchange_ts", pa.int64()),
+            ("local_recv_ts", pa.int64()),
+            ("lastUpdateId", pa.int64()),
+        ]
+        for i in range(1000):
+            orderbook_fields.append((f"bid_price_{i}", pa.float32()))
+            orderbook_fields.append((f"bid_qty_{i}", pa.float32()))
+            orderbook_fields.append((f"ask_price_{i}", pa.float32()))
+            orderbook_fields.append((f"ask_qty_{i}", pa.float32()))
+
         return {
-            "orderbook_snapshots": pa.schema(
-                [
-                    ("exchange_ts", pa.int64()),
-                    ("local_recv_ts", pa.int64()),
-                    ("lastUpdateId", pa.int64()),
-                ] +
-                [
-                    (f"bid_price_{i}", pa.float64()) for i in range(1000)
-                ] +
-                [
-                    (f"bid_qty_{i}", pa.float64()) for i in range(1000)
-                ] +
-                [
-                    (f"ask_price_{i}", pa.float64()) for i in range(1000)
-                ] +
-                [
-                    (f"ask_qty_{i}", pa.float64()) for i in range(1000)
-                ]
-            ),
+            "orderbook_snapshots": pa.schema(orderbook_fields),
             "aggTrades": pa.schema([
                 ("tradeId", pa.int64()), ("price", pa.float64()), ("qty", pa.float64()),
                 ("isBuyerMaker", pa.bool_()), ("exchange_ts", pa.int64()), ("local_recv_ts", pa.int64())
@@ -182,7 +176,7 @@ class DataStorage:
             self._writers[stream_type].write_table(table)
 
             if stream_type in self._wal_loggers:
-                self._wal_loggers[stream_type].clear() 
+                self._wal_loggers[stream_type].clear()
 
         except Exception as e:
             logger.error(f"Flush error for {stream_type}: {e}", exc_info=True)

@@ -23,8 +23,8 @@ class BinanceFuturesCollector:
         self.contract_size = 1.0
         self._book_synced = False
         self._last_depth_exchange_ts = 0
-        self._last_snapshot_local_ts = 0  # время последнего снапшота (в ms)
-        self._reinit_in_progress = False  # 🔒 защита от параллельных восстановлений
+        self._last_snapshot_local_ts = 0
+        self._reinit_in_progress = False
 
     async def fetch_exchange_info(self):
         url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
@@ -43,13 +43,12 @@ class BinanceFuturesCollector:
                 return await resp.json()
             elif resp.status in (418, 429):
                 logger.warning(f"⚠️ Rate limit hit (HTTP {resp.status}). IP likely banned. Pausing reinit.")
-                return None  # не пытаемся повторять
+                return None
             else:
                 logger.error(f"❌ Failed to fetch snapshot: {resp.status}")
                 return None
 
     async def fetch_open_interest(self):
-        """Получает текущий открытый интерес через правильный эндпоинт."""
         url = "https://fapi.binance.com/fapi/v1/openInterest"
         params = {"symbol": self.symbol}
         mark_url = f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={self.symbol}"
@@ -81,7 +80,6 @@ class BinanceFuturesCollector:
             logger.error(f"Open interest fetch error: {e}", exc_info=True)
 
     def _trigger_orderbook_resync(self):
-        """Запускает ресинхронизацию ТОЛЬКО если стакан был синхронизирован и восстановление не идёт."""
         if not self.running or not self._book_synced or self._reinit_in_progress:
             return
         logger.info("🔄 Triggering OrderBook resync due to desync")
@@ -89,18 +87,16 @@ class BinanceFuturesCollector:
         asyncio.create_task(self._delayed_reinit_orderbook())
 
     async def _delayed_reinit_orderbook(self):
-        """Откладывает реинициализацию на 0.5 сек, чтобы избежать шторма запросов."""
         if self._reinit_in_progress:
             return
         self._reinit_in_progress = True
         try:
-            await asyncio.sleep(0.5)  # дать сети стабилизироваться
+            await asyncio.sleep(0.5)
             await self._reinit_orderbook_after_disconnect()
         finally:
             self._reinit_in_progress = False
 
     async def _reinit_orderbook_after_disconnect(self):
-        """Пытается восстановить стакан. Вызывается только один раз за раз."""
         if not self.running:
             return
 
@@ -122,7 +118,6 @@ class BinanceFuturesCollector:
             except Exception as e:
                 logger.warning(f"⚠️ Snapshot attempt {attempt+1}/5 failed: {e}")
             
-            # Экспоненциальная задержка
             delay = min(base_delay * (2 ** attempt), 60.0)
             logger.info(f"  ⏳ Waiting {delay:.1f}s before next snapshot attempt...")
             await asyncio.sleep(delay)
@@ -167,7 +162,6 @@ class BinanceFuturesCollector:
             logger.info("📭 No WAL files found — clean start")
 
     async def periodic_orderbook_snapshot(self):
-        """FALLBACK: сохраняет снапшот каждые N мс, если стакан не обновлялся."""
         logger.info("✅ Periodic orderbook snapshot task STARTED (fallback)")
         while self.running:
             try:
@@ -187,6 +181,13 @@ class BinanceFuturesCollector:
             await self.fetch_open_interest()
             await asyncio.sleep(self.cfg.open_interest_fetch_interval_sec)
 
+    def _process_depth_diff(self, msg: Dict[str, Any]):
+        local_recv = int(time.time() * 1000)
+        self._last_depth_exchange_ts = msg["E"]
+
+        if self._book_synced:
+            self._try_save_snapshot(exchange_ts=msg["E"], local_ts=local_recv)
+
     def _try_save_snapshot(self, exchange_ts: int, local_ts: int):
         interval_ms = int(self.cfg.orderbook_snapshot_interval_sec * 1000)
         if local_ts - self._last_snapshot_local_ts >= interval_ms:
@@ -196,7 +197,7 @@ class BinanceFuturesCollector:
         try:
             bids, asks = self.book.get_top_n(self.cfg.orderbook_levels)  # 1000 уровней
 
-            # Дополняем до 1000 уровней, если данных меньше
+            # Дополняем до 1000 уровней нулями
             while len(bids) < 1000:
                 bids.append((0.0, 0.0))
             while len(asks) < 1000:
@@ -208,13 +209,9 @@ class BinanceFuturesCollector:
                 "lastUpdateId": self.book.last_update_id,
             }
 
-            # Заполняем bid_price_i, bid_qty_i
             for i in range(1000):
                 record[f"bid_price_{i}"] = bids[i][0]
                 record[f"bid_qty_{i}"] = bids[i][1]
-
-            # Заполняем ask_price_i, ask_qty_i
-            for i in range(1000):
                 record[f"ask_price_{i}"] = asks[i][0]
                 record[f"ask_qty_{i}"] = asks[i][1]
 
@@ -222,7 +219,7 @@ class BinanceFuturesCollector:
             self._last_snapshot_local_ts = local_ts
             logger.debug(f"📸 Saved flat orderbook snapshot @ {exchange_ts}")
         except Exception as e:
-            logger.error(f"💥 Failed to save flat orderbook snapshot: {e}", exc_info=True)
+            logger.error(f"💥 Failed to save orderbook snapshot: {e}", exc_info=True)
 
     async def _depth_handler(self, msg: dict):
         if not self._book_synced:
@@ -230,11 +227,13 @@ class BinanceFuturesCollector:
                 logger.info(f"✅ OrderBook SYNCED (@100ms) with u={msg['u']}")
                 self.book.apply_diff(msg)
                 self._book_synced = True
+                self._process_depth_diff(msg)
             else:
                 logger.debug(f"🔄 Skipping outdated diff: u={msg['u']} < {self.book.last_update_id}")
             return
 
         self.book.apply_diff(msg)
+        self._process_depth_diff(msg)
 
     def process_agg_trade(self, msg: Dict[str, Any]):
         self.storage.buffer("aggTrades", {
@@ -332,7 +331,7 @@ class BinanceFuturesCollector:
                     logger.debug(f"🔍 Validation: local bid={local_best_bid}, REST bid={rest_best_bid}, diff={bid_diff:.6f}")
                     logger.debug(f"🔍 Validation: local ask={local_best_ask}, REST ask={rest_best_ask}, diff={ask_diff:.6f}")
 
-                    if bid_diff > 0.0005 or ask_diff > 0.0005:
+                    if bid_diff > 0.00001 or ask_diff > 0.00001:
                         logger.critical(
                             f"💥 OrderBook VALIDATION FAILED! "
                             f"Bid diff: {bid_diff:.4%}, Ask diff: {ask_diff:.4%} — triggering resync"
