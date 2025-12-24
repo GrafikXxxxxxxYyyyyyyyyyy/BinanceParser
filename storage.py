@@ -82,41 +82,41 @@ class DataStorage:
 
     def _define_schemas(self) -> Dict[str, pa.Schema]:
         return {
-            "depthDiffs": pa.schema([
-                ("U", pa.int64()),
-                ("u", pa.int64()),
-                ("bids", pa.string()), ("asks", pa.string()),
-                ("exchange_ts", pa.int64()), ("local_recv_ts", pa.int64())
-            ]),
             "orderbook_snapshots": pa.schema([
-                ("exchange_ts", pa.int64()), ("local_recv_ts", pa.int64()),
-                ("bids", pa.string()), ("asks", pa.string()),
-                ("lastUpdateId", pa.int64())
+                ("exchange_ts", pa.int64()),
+                ("lastUpdateId", pa.int64()),
+                ("side", pa.dictionary(pa.int8(), pa.string())),
+                ("level", pa.int16()),
+                ("price", pa.float32()),
+                ("qty", pa.float32())
             ]),
             "aggTrades": pa.schema([
-                ("tradeId", pa.int64()), ("price", pa.float64()), ("qty", pa.float64()),
-                ("isBuyerMaker", pa.bool_()), ("exchange_ts", pa.int64()), ("local_recv_ts", pa.int64())
+                ("tradeId", pa.int64()),
+                ("price", pa.float32()),
+                ("qty", pa.float32()),
+                ("isBuyerMaker", pa.bool_()),
+                ("exchange_ts", pa.int64())
             ]),
             "rawTrades": pa.schema([
-                ("id", pa.int64()), ("price", pa.float64()), ("qty", pa.float64()),
-                ("isBuyerMaker", pa.bool_()), ("exchange_ts", pa.int64()), ("local_recv_ts", pa.int64())
+                ("id", pa.int64()),
+                ("price", pa.float32()),
+                ("qty", pa.float32()),
+                ("isBuyerMaker", pa.bool_()),
+                ("exchange_ts", pa.int64())
             ]),
             "markPrice": pa.schema([
-                ("markPrice", pa.float64()), ("indexPrice", pa.float64()), ("fundingRate", pa.float64()),
-                ("nextFundingTime", pa.int64()), ("exchange_ts", pa.int64()), ("local_recv_ts", pa.int64())
-            ]),
-            "liquidations": pa.schema([
-                ("symbol", pa.string()), ("side", pa.string()), ("price", pa.float64()),
-                ("qty", pa.float64()), ("exchange_ts", pa.int64()), ("local_recv_ts", pa.int64())
+                ("markPrice", pa.float32()),
+                ("indexPrice", pa.float32()),
+                ("fundingRate", pa.float32()),
+                ("nextFundingTime", pa.int64()),
+                ("exchange_ts", pa.int64())
             ]),
             "bookTicker": pa.schema([
-                ("bestBid", pa.float64()), ("bestBidQty", pa.float64()),
-                ("bestAsk", pa.float64()), ("bestAskQty", pa.float64()),
-                ("exchange_ts", pa.int64()), ("local_recv_ts", pa.int64())
-            ]),
-            "openInterest": pa.schema([
-                ("openInterest", pa.float64()), ("valueUSD", pa.float64()),
-                ("exchange_ts", pa.int64()), ("local_recv_ts", pa.int64())
+                ("bestBid", pa.float32()),
+                ("bestBidQty", pa.float32()),
+                ("bestAsk", pa.float32()),
+                ("bestAskQty", pa.float32()),
+                ("exchange_ts", pa.int64())
             ])
         }
 
@@ -150,7 +150,7 @@ class DataStorage:
             self._current_hour[stream_type] = current_hour
             path = self._get_path(stream_type, current_hour)
             self._writers[stream_type] = pq.ParquetWriter(
-                path, self._schemas[stream_type], compression='zstd'
+                path, self._schemas[stream_type], compression='zstd', compression_level=7
             )
 
     def _close_writer(self, stream_type: str):
@@ -178,7 +178,7 @@ class DataStorage:
             self._writers[stream_type].write_table(table)
 
             if stream_type in self._wal_loggers:
-                self._wal_loggers[stream_type].clear() 
+                self._wal_loggers[stream_type].clear()
 
         except Exception as e:
             logger.error(f"Flush error for {stream_type}: {e}", exc_info=True)

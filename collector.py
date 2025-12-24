@@ -23,8 +23,8 @@ class BinanceFuturesCollector:
         self.contract_size = 1.0
         self._book_synced = False
         self._last_depth_exchange_ts = 0
-        self._last_snapshot_local_ts = 0  # время последнего снапшота (в ms)
-        self._reinit_in_progress = False  # 🔒 защита от параллельных восстановлений
+        self._last_snapshot_local_ts = 0
+        self._reinit_in_progress = False
 
     async def fetch_exchange_info(self):
         url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
@@ -43,45 +43,12 @@ class BinanceFuturesCollector:
                 return await resp.json()
             elif resp.status in (418, 429):
                 logger.warning(f"⚠️ Rate limit hit (HTTP {resp.status}). IP likely banned. Pausing reinit.")
-                return None  # не пытаемся повторять
+                return None
             else:
                 logger.error(f"❌ Failed to fetch snapshot: {resp.status}")
                 return None
 
-    async def fetch_open_interest(self):
-        """Получает текущий открытый интерес через правильный эндпоинт."""
-        url = "https://fapi.binance.com/fapi/v1/openInterest"
-        params = {"symbol": self.symbol}
-        mark_url = f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={self.symbol}"
-
-        try:
-            async with self.session.get(url, params=params) as oi_resp:
-                if oi_resp.status != 200:
-                    logger.warning(f"OI fetch failed: {oi_resp.status}")
-                    return
-                oi_data = await oi_resp.json()
-                open_interest = float(oi_data["openInterest"])
-
-            async with self.session.get(mark_url) as mark_resp:
-                if mark_resp.status != 200:
-                    logger.warning(f"Mark price fetch failed: {mark_resp.status}")
-                    return
-                mark_data = await mark_resp.json()
-                mark_price = float(mark_data.get("markPrice", 0))
-
-            value_usd = open_interest * mark_price * self.contract_size
-
-            self.storage.buffer("openInterest", {
-                "exchange_ts": int(time.time() * 1000),
-                "local_recv_ts": int(time.time() * 1000),
-                "openInterest": open_interest,
-                "valueUSD": value_usd
-            })
-        except Exception as e:
-            logger.error(f"Open interest fetch error: {e}", exc_info=True)
-
     def _trigger_orderbook_resync(self):
-        """Запускает ресинхронизацию ТОЛЬКО если стакан был синхронизирован и восстановление не идёт."""
         if not self.running or not self._book_synced or self._reinit_in_progress:
             return
         logger.info("🔄 Triggering OrderBook resync due to desync")
@@ -89,18 +56,16 @@ class BinanceFuturesCollector:
         asyncio.create_task(self._delayed_reinit_orderbook())
 
     async def _delayed_reinit_orderbook(self):
-        """Откладывает реинициализацию на 0.5 сек, чтобы избежать шторма запросов."""
         if self._reinit_in_progress:
             return
         self._reinit_in_progress = True
         try:
-            await asyncio.sleep(0.5)  # дать сети стабилизироваться
+            await asyncio.sleep(0.5)
             await self._reinit_orderbook_after_disconnect()
         finally:
             self._reinit_in_progress = False
 
     async def _reinit_orderbook_after_disconnect(self):
-        """Пытается восстановить стакан. Вызывается только один раз за раз."""
         if not self.running:
             return
 
@@ -122,7 +87,6 @@ class BinanceFuturesCollector:
             except Exception as e:
                 logger.warning(f"⚠️ Snapshot attempt {attempt+1}/5 failed: {e}")
             
-            # Экспоненциальная задержка
             delay = min(base_delay * (2 ** attempt), 60.0)
             logger.info(f"  ⏳ Waiting {delay:.1f}s before next snapshot attempt...")
             await asyncio.sleep(delay)
@@ -167,62 +131,64 @@ class BinanceFuturesCollector:
             logger.info("📭 No WAL files found — clean start")
 
     async def periodic_orderbook_snapshot(self):
-        """FALLBACK: сохраняет снапшот каждые N мс, если стакан не обновлялся."""
         logger.info("✅ Periodic orderbook snapshot task STARTED (fallback)")
         while self.running:
             try:
                 if self._book_synced and self._last_depth_exchange_ts != 0:
-                    local_ts = int(time.time() * 1000)
-                    self._try_save_snapshot(
-                        exchange_ts=self._last_depth_exchange_ts,
-                        local_ts=local_ts
-                    )
+                    exchange_ts = self._last_depth_exchange_ts
+                    self._try_save_snapshot(exchange_ts=exchange_ts)
             except Exception as e:
                 logger.error(f"💥 Periodic snapshot error: {e}", exc_info=True)
             await asyncio.sleep(self.cfg.orderbook_snapshot_interval_sec)
 
-    async def periodic_open_interest(self):
-        logger.info("✅ Open Interest fetcher STARTED (1Hz)")
-        while self.running:
-            await self.fetch_open_interest()
-            await asyncio.sleep(self.cfg.open_interest_fetch_interval_sec)
-
     def _process_depth_diff(self, msg: Dict[str, Any]):
-        local_recv = int(time.time() * 1000)
         self._last_depth_exchange_ts = msg["E"]
-        self.storage.buffer("depthDiffs", {
-            "U": msg["U"],
-            "u": msg["u"],
-            "bids": msg["b"],
-            "asks": msg["a"],
-            "exchange_ts": msg["E"],
-            "local_recv_ts": local_recv
-        })
 
         if self._book_synced:
-            self._try_save_snapshot(exchange_ts=msg["E"], local_ts=local_recv)
+            self._try_save_snapshot(exchange_ts=msg["E"])
 
-    def _try_save_snapshot(self, exchange_ts: int, local_ts: int):
+    def _try_save_snapshot(self, exchange_ts: int):
         interval_ms = int(self.cfg.orderbook_snapshot_interval_sec * 1000)
-        if local_ts - self._last_snapshot_local_ts >= interval_ms:
-            self._save_orderbook_snapshot(exchange_ts, local_ts)
+        current_ts = int(time.time() * 1000)
+        if current_ts - self._last_snapshot_local_ts >= interval_ms:
+            self._save_orderbook_snapshot(exchange_ts)
+            self._last_snapshot_local_ts = current_ts
 
-    def _save_orderbook_snapshot(self, exchange_ts: int, local_ts: int):
+    def _save_orderbook_snapshot(self, exchange_ts: int):
         try:
             bids, asks = self.book.get_top_n(self.cfg.orderbook_levels)
-            if not bids or not asks:
-                return
-            self.storage.buffer("orderbook_snapshots", {
-                "exchange_ts": exchange_ts,
-                "local_recv_ts": local_ts,
-                "bids": bids,
-                "asks": asks,
-                "lastUpdateId": self.book.last_update_id
-            })
-            self._last_snapshot_local_ts = local_ts
-            logger.debug(f"📸 Saved orderbook snapshot @ {exchange_ts}")
+
+            records = []
+            for level, (price, qty) in enumerate(bids):
+                if level >= 1000:
+                    break
+                records.append({
+                    "exchange_ts": exchange_ts,
+                    "lastUpdateId": self.book.last_update_id,
+                    "side": "bid",
+                    "level": level,
+                    "price": price,
+                    "qty": qty
+                })
+
+            for level, (price, qty) in enumerate(asks):
+                if level >= 1000:
+                    break
+                records.append({
+                    "exchange_ts": exchange_ts,
+                    "lastUpdateId": self.book.last_update_id,
+                    "side": "ask",
+                    "level": level,
+                    "price": price,
+                    "qty": qty
+                })
+
+            for rec in records:
+                self.storage.buffer("orderbook_snapshots", rec)
+
+            logger.debug(f"📸 Saved long-format orderbook snapshot @ {exchange_ts} ({len(records)} records)")
         except Exception as e:
-            logger.error(f"💥 Failed to save orderbook snapshot: {e}", exc_info=True)
+            logger.error(f"💥 Failed to save long-format orderbook snapshot: {e}", exc_info=True)
 
     async def _depth_handler(self, msg: dict):
         if not self._book_synced:
@@ -244,8 +210,7 @@ class BinanceFuturesCollector:
             "price": float(msg["p"]),
             "qty": float(msg["q"]),
             "isBuyerMaker": msg["m"],
-            "exchange_ts": msg["T"],
-            "local_recv_ts": int(time.time() * 1000)
+            "exchange_ts": msg["T"]
         })
 
     def process_raw_trade(self, msg: Dict[str, Any]):
@@ -254,8 +219,7 @@ class BinanceFuturesCollector:
             "price": float(msg["p"]),
             "qty": float(msg["q"]),
             "isBuyerMaker": msg["m"],
-            "exchange_ts": msg["T"],
-            "local_recv_ts": int(time.time() * 1000)
+            "exchange_ts": msg["T"]
         })
 
     def process_mark_price(self, msg: Dict[str, Any]):
@@ -264,29 +228,14 @@ class BinanceFuturesCollector:
             "indexPrice": float(msg["i"]),
             "fundingRate": float(msg["r"]),
             "nextFundingTime": msg["T"],
-            "exchange_ts": msg["E"],
-            "local_recv_ts": int(time.time() * 1000)
-        })
-
-    def process_liquidation(self, msg: Dict[str, Any]):
-        o = msg["o"]
-        if o["s"] != self.symbol:
-            return
-        self.storage.buffer("liquidations", {
-            "symbol": o["s"],
-            "side": o["S"],
-            "price": float(o["p"]),
-            "qty": float(o["q"]),
-            "exchange_ts": o["T"],
-            "local_recv_ts": int(time.time() * 1000)
+            "exchange_ts": msg["E"]
         })
 
     def process_book_ticker(self, msg: Dict[str, Any]):
         self.storage.buffer("bookTicker", {
             "bestBid": float(msg["b"]), "bestBidQty": float(msg["B"]),
             "bestAsk": float(msg["a"]), "bestAskQty": float(msg["A"]),
-            "exchange_ts": msg["E"],
-            "local_recv_ts": int(time.time() * 1000)
+            "exchange_ts": msg["E"]
         })
 
     async def websocket_reader(self, stream_url: str, handler):
@@ -347,7 +296,7 @@ class BinanceFuturesCollector:
                     logger.debug(f"🔍 Validation: local bid={local_best_bid}, REST bid={rest_best_bid}, diff={bid_diff:.6f}")
                     logger.debug(f"🔍 Validation: local ask={local_best_ask}, REST ask={rest_best_ask}, diff={ask_diff:.6f}")
 
-                    if bid_diff > 0.0005 or ask_diff > 0.0005:
+                    if bid_diff > 0.00001 or ask_diff > 0.00001:
                         logger.critical(
                             f"💥 OrderBook VALIDATION FAILED! "
                             f"Bid diff: {bid_diff:.4%}, Ask diff: {ask_diff:.4%} — triggering resync"
@@ -365,7 +314,6 @@ class BinanceFuturesCollector:
     async def handle_agg_trade(self, msg): self.process_agg_trade(msg)
     async def handle_raw_trade(self, msg): self.process_raw_trade(msg)
     async def handle_mark_price(self, msg): self.process_mark_price(msg)
-    async def handle_liquidation(self, msg): self.process_liquidation(msg)
     async def handle_book_ticker(self, msg): self.process_book_ticker(msg)
 
     async def periodic_flush(self):
@@ -407,7 +355,6 @@ class BinanceFuturesCollector:
             (f"wss://fstream.binance.com/ws/{self.symbol.lower()}@aggTrade", self.handle_agg_trade),
             (f"wss://fstream.binance.com/ws/{self.symbol.lower()}@trade", self.handle_raw_trade),
             (f"wss://fstream.binance.com/ws/{self.symbol.lower()}@markPrice@1s", self.handle_mark_price),
-            ("wss://fstream.binance.com/ws/!forceOrder@arr", self.handle_liquidation),
             (f"wss://fstream.binance.com/ws/{self.symbol.lower()}@bookTicker", self.handle_book_ticker),
         ]
 
@@ -415,9 +362,8 @@ class BinanceFuturesCollector:
 
         tasks = [
             self.safe_task(self.periodic_orderbook_snapshot, "orderbook_snapshot"),
-            self.safe_task(self.periodic_open_interest, "open_interest"),
-            self.safe_task(self.periodic_flush, "periodic_flush"),
             self.safe_task(self.validate_orderbook, "orderbook_validator"),
+            self.safe_task(self.periodic_flush, "periodic_flush"),
         ]
         tasks += [
             self.safe_task(partial(self.websocket_reader, url, handler), f"ws_{i}")
