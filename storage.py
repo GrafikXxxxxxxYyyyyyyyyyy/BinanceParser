@@ -82,17 +82,25 @@ class DataStorage:
 
     def _define_schemas(self) -> Dict[str, pa.Schema]:
         return {
-            "depthDiffs": pa.schema([
-                ("U", pa.int64()),
-                ("u", pa.int64()),
-                ("bids", pa.string()), ("asks", pa.string()),
-                ("exchange_ts", pa.int64()), ("local_recv_ts", pa.int64())
-            ]),
-            "orderbook_snapshots": pa.schema([
-                ("exchange_ts", pa.int64()), ("local_recv_ts", pa.int64()),
-                ("bids", pa.string()), ("asks", pa.string()),
-                ("lastUpdateId", pa.int64())
-            ]),
+            "orderbook_snapshots": pa.schema(
+                [
+                    ("exchange_ts", pa.int64()),
+                    ("local_recv_ts", pa.int64()),
+                    ("lastUpdateId", pa.int64()),
+                ] +
+                [
+                    (f"bid_price_{i}", pa.float64()) for i in range(1000)
+                ] +
+                [
+                    (f"bid_qty_{i}", pa.float64()) for i in range(1000)
+                ] +
+                [
+                    (f"ask_price_{i}", pa.float64()) for i in range(1000)
+                ] +
+                [
+                    (f"ask_qty_{i}", pa.float64()) for i in range(1000)
+                ]
+            ),
             "aggTrades": pa.schema([
                 ("tradeId", pa.int64()), ("price", pa.float64()), ("qty", pa.float64()),
                 ("isBuyerMaker", pa.bool_()), ("exchange_ts", pa.int64()), ("local_recv_ts", pa.int64())
@@ -104,10 +112,6 @@ class DataStorage:
             "markPrice": pa.schema([
                 ("markPrice", pa.float64()), ("indexPrice", pa.float64()), ("fundingRate", pa.float64()),
                 ("nextFundingTime", pa.int64()), ("exchange_ts", pa.int64()), ("local_recv_ts", pa.int64())
-            ]),
-            "liquidations": pa.schema([
-                ("symbol", pa.string()), ("side", pa.string()), ("price", pa.float64()),
-                ("qty", pa.float64()), ("exchange_ts", pa.int64()), ("local_recv_ts", pa.int64())
             ]),
             "bookTicker": pa.schema([
                 ("bestBid", pa.float64()), ("bestBidQty", pa.float64()),

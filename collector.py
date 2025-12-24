@@ -187,21 +187,6 @@ class BinanceFuturesCollector:
             await self.fetch_open_interest()
             await asyncio.sleep(self.cfg.open_interest_fetch_interval_sec)
 
-    def _process_depth_diff(self, msg: Dict[str, Any]):
-        local_recv = int(time.time() * 1000)
-        self._last_depth_exchange_ts = msg["E"]
-        self.storage.buffer("depthDiffs", {
-            "U": msg["U"],
-            "u": msg["u"],
-            "bids": msg["b"],
-            "asks": msg["a"],
-            "exchange_ts": msg["E"],
-            "local_recv_ts": local_recv
-        })
-
-        if self._book_synced:
-            self._try_save_snapshot(exchange_ts=msg["E"], local_ts=local_recv)
-
     def _try_save_snapshot(self, exchange_ts: int, local_ts: int):
         interval_ms = int(self.cfg.orderbook_snapshot_interval_sec * 1000)
         if local_ts - self._last_snapshot_local_ts >= interval_ms:
@@ -209,20 +194,35 @@ class BinanceFuturesCollector:
 
     def _save_orderbook_snapshot(self, exchange_ts: int, local_ts: int):
         try:
-            bids, asks = self.book.get_top_n(self.cfg.orderbook_levels)
-            if not bids or not asks:
-                return
-            self.storage.buffer("orderbook_snapshots", {
+            bids, asks = self.book.get_top_n(self.cfg.orderbook_levels)  # 1000 уровней
+
+            # Дополняем до 1000 уровней, если данных меньше
+            while len(bids) < 1000:
+                bids.append((0.0, 0.0))
+            while len(asks) < 1000:
+                asks.append((0.0, 0.0))
+
+            record = {
                 "exchange_ts": exchange_ts,
                 "local_recv_ts": local_ts,
-                "bids": bids,
-                "asks": asks,
-                "lastUpdateId": self.book.last_update_id
-            })
+                "lastUpdateId": self.book.last_update_id,
+            }
+
+            # Заполняем bid_price_i, bid_qty_i
+            for i in range(1000):
+                record[f"bid_price_{i}"] = bids[i][0]
+                record[f"bid_qty_{i}"] = bids[i][1]
+
+            # Заполняем ask_price_i, ask_qty_i
+            for i in range(1000):
+                record[f"ask_price_{i}"] = asks[i][0]
+                record[f"ask_qty_{i}"] = asks[i][1]
+
+            self.storage.buffer("orderbook_snapshots", record)
             self._last_snapshot_local_ts = local_ts
-            logger.debug(f"📸 Saved orderbook snapshot @ {exchange_ts}")
+            logger.debug(f"📸 Saved flat orderbook snapshot @ {exchange_ts}")
         except Exception as e:
-            logger.error(f"💥 Failed to save orderbook snapshot: {e}", exc_info=True)
+            logger.error(f"💥 Failed to save flat orderbook snapshot: {e}", exc_info=True)
 
     async def _depth_handler(self, msg: dict):
         if not self._book_synced:
@@ -230,13 +230,11 @@ class BinanceFuturesCollector:
                 logger.info(f"✅ OrderBook SYNCED (@100ms) with u={msg['u']}")
                 self.book.apply_diff(msg)
                 self._book_synced = True
-                self._process_depth_diff(msg)
             else:
                 logger.debug(f"🔄 Skipping outdated diff: u={msg['u']} < {self.book.last_update_id}")
             return
 
         self.book.apply_diff(msg)
-        self._process_depth_diff(msg)
 
     def process_agg_trade(self, msg: Dict[str, Any]):
         self.storage.buffer("aggTrades", {
@@ -265,19 +263,6 @@ class BinanceFuturesCollector:
             "fundingRate": float(msg["r"]),
             "nextFundingTime": msg["T"],
             "exchange_ts": msg["E"],
-            "local_recv_ts": int(time.time() * 1000)
-        })
-
-    def process_liquidation(self, msg: Dict[str, Any]):
-        o = msg["o"]
-        if o["s"] != self.symbol:
-            return
-        self.storage.buffer("liquidations", {
-            "symbol": o["s"],
-            "side": o["S"],
-            "price": float(o["p"]),
-            "qty": float(o["q"]),
-            "exchange_ts": o["T"],
             "local_recv_ts": int(time.time() * 1000)
         })
 
@@ -365,7 +350,6 @@ class BinanceFuturesCollector:
     async def handle_agg_trade(self, msg): self.process_agg_trade(msg)
     async def handle_raw_trade(self, msg): self.process_raw_trade(msg)
     async def handle_mark_price(self, msg): self.process_mark_price(msg)
-    async def handle_liquidation(self, msg): self.process_liquidation(msg)
     async def handle_book_ticker(self, msg): self.process_book_ticker(msg)
 
     async def periodic_flush(self):
@@ -407,7 +391,6 @@ class BinanceFuturesCollector:
             (f"wss://fstream.binance.com/ws/{self.symbol.lower()}@aggTrade", self.handle_agg_trade),
             (f"wss://fstream.binance.com/ws/{self.symbol.lower()}@trade", self.handle_raw_trade),
             (f"wss://fstream.binance.com/ws/{self.symbol.lower()}@markPrice@1s", self.handle_mark_price),
-            ("wss://fstream.binance.com/ws/!forceOrder@arr", self.handle_liquidation),
             (f"wss://fstream.binance.com/ws/{self.symbol.lower()}@bookTicker", self.handle_book_ticker),
         ]
 
