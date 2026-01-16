@@ -1,7 +1,6 @@
 # live_collector.py
 import asyncio
 import json
-import time
 import logging
 from typing import Dict, Any, Optional
 from collections import defaultdict
@@ -22,14 +21,12 @@ class LiveCollector:
         symbol: str = "BTCUSDT",
         retention_seconds: int = 30,
         orderbook_levels: int = 1000,
-        orderbook_snapshot_interval_sec: float = 0.2,
+        orderbook_snapshot_interval_sec: float = 0.2,  # больше не используется
         open_interest_fetch_interval_sec: float = 1.0,
     ):
         self.symbol = symbol.upper()
         self.retention_ms = retention_seconds * 1000
         self.orderbook_levels = orderbook_levels
-        self.orderbook_snapshot_interval_sec = orderbook_snapshot_interval_sec
-        self.open_interest_fetch_interval_sec = open_interest_fetch_interval_sec
 
         self.book = OrderBook(self.symbol)
         self._buffers: Dict[str, InMemoryBuffer] = defaultdict(
@@ -40,10 +37,8 @@ class LiveCollector:
         self.contract_size = 1.0
         self._book_synced = False
         self._last_depth_exchange_ts = 0
-        self._last_snapshot_local_ts = 0
         self._reinit_in_progress = False
 
-        # Инициализируем все потоки согласно storage.py
         stream_types = [
             "orderbook_snapshots", "aggTrades", "rawTrades",
             "markPrice", "bookTicker"
@@ -132,13 +127,8 @@ class LiveCollector:
     def _process_depth_diff(self, msg: Dict[str, Any]):
         self._last_depth_exchange_ts = msg["E"]
         if self._book_synced:
-            self._try_save_snapshot(exchange_ts=msg["E"])
-
-    def _try_save_snapshot(self, exchange_ts: int):
-        current_ts = int(time.time() * 1000)
-        if current_ts - self._last_snapshot_local_ts >= int(self.orderbook_snapshot_interval_sec * 1000):
-            self._save_orderbook_snapshot(exchange_ts)
-            self._last_snapshot_local_ts = current_ts
+            # 🔥 Сохраняем ПОЛНЫЙ стакан после КАЖДОГО обновления
+            self._save_orderbook_snapshot(exchange_ts=msg["E"])
 
     def _save_orderbook_snapshot(self, exchange_ts: int):
         try:
@@ -248,17 +238,7 @@ class LiveCollector:
                 await asyncio.sleep(delay)
         logger.error(f"❌ Max reconnect attempts reached for {stream_url}")
 
-    async def periodic_orderbook_snapshot(self):
-        while self.running:
-            try:
-                if self._book_synced and self._last_depth_exchange_ts != 0:
-                    self._try_save_snapshot(exchange_ts=self._last_depth_exchange_ts)
-            except Exception as e:
-                logger.error(f"💥 Periodic snapshot error: {e}", exc_info=True)
-            await asyncio.sleep(self.orderbook_snapshot_interval_sec)
-
     def get_dataframe(self, stream_type: str) -> pd.DataFrame:
-        """Возвращает актуальный pd.DataFrame с последними данными (до 5 минут)."""
         if stream_type not in self._buffers:
             return pd.DataFrame()
         return self._buffers[stream_type].to_dataframe()
@@ -280,9 +260,7 @@ class LiveCollector:
             (f"wss://fstream.binance.com/ws/{self.symbol.lower()}@bookTicker", self.process_book_ticker),
         ]
 
-        tasks = [
-            asyncio.create_task(self.periodic_orderbook_snapshot()),
-        ]
+        tasks = []
         tasks += [
             asyncio.create_task(self.websocket_reader(url, handler))
             for url, handler in streams

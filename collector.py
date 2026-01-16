@@ -1,6 +1,6 @@
+# collector.py
 import asyncio
 import json
-import time
 import logging
 from typing import Dict, Any
 from aiohttp import ClientSession
@@ -23,7 +23,6 @@ class BinanceFuturesCollector:
         self.contract_size = 1.0
         self._book_synced = False
         self._last_depth_exchange_ts = 0
-        self._last_snapshot_local_ts = 0
         self._reinit_in_progress = False
 
     async def fetch_exchange_info(self):
@@ -130,38 +129,18 @@ class BinanceFuturesCollector:
         else:
             logger.info("📭 No WAL files found — clean start")
 
-    async def periodic_orderbook_snapshot(self):
-        logger.info("✅ Periodic orderbook snapshot task STARTED (fallback)")
-        while self.running:
-            try:
-                if self._book_synced and self._last_depth_exchange_ts != 0:
-                    exchange_ts = self._last_depth_exchange_ts
-                    self._try_save_snapshot(exchange_ts=exchange_ts)
-            except Exception as e:
-                logger.error(f"💥 Periodic snapshot error: {e}", exc_info=True)
-            await asyncio.sleep(self.cfg.orderbook_snapshot_interval_sec)
-
     def _process_depth_diff(self, msg: Dict[str, Any]):
         self._last_depth_exchange_ts = msg["E"]
-
         if self._book_synced:
-            self._try_save_snapshot(exchange_ts=msg["E"])
-
-    def _try_save_snapshot(self, exchange_ts: int):
-        interval_ms = int(self.cfg.orderbook_snapshot_interval_sec * 1000)
-        current_ts = int(time.time() * 1000)
-        if current_ts - self._last_snapshot_local_ts >= interval_ms:
-            self._save_orderbook_snapshot(exchange_ts)
-            self._last_snapshot_local_ts = current_ts
+            # 🔥 Сохраняем ПОЛНЫЙ стакан после КАЖДОГО обновления
+            self._save_orderbook_snapshot(exchange_ts=msg["E"])
 
     def _save_orderbook_snapshot(self, exchange_ts: int):
         try:
             bids, asks = self.book.get_top_n(self.cfg.orderbook_levels)
 
             records = []
-            for level, (price, qty) in enumerate(bids):
-                if level >= 1000:
-                    break
+            for level, (price, qty) in enumerate(bids[:1000]):
                 records.append({
                     "exchange_ts": exchange_ts,
                     "lastUpdateId": self.book.last_update_id,
@@ -171,9 +150,7 @@ class BinanceFuturesCollector:
                     "qty": qty
                 })
 
-            for level, (price, qty) in enumerate(asks):
-                if level >= 1000:
-                    break
+            for level, (price, qty) in enumerate(asks[:1000]):
                 records.append({
                     "exchange_ts": exchange_ts,
                     "lastUpdateId": self.book.last_update_id,
@@ -186,9 +163,9 @@ class BinanceFuturesCollector:
             for rec in records:
                 self.storage.buffer("orderbook_snapshots", rec)
 
-            logger.debug(f"📸 Saved long-format orderbook snapshot @ {exchange_ts} ({len(records)} records)")
+            logger.debug(f"📸 Saved full orderbook snapshot @ {exchange_ts} ({len(records)} records)")
         except Exception as e:
-            logger.error(f"💥 Failed to save long-format orderbook snapshot: {e}", exc_info=True)
+            logger.error(f"💥 Failed to save orderbook snapshot: {e}", exc_info=True)
 
     async def _depth_handler(self, msg: dict):
         if not self._book_synced:
@@ -361,7 +338,6 @@ class BinanceFuturesCollector:
         from functools import partial
 
         tasks = [
-            self.safe_task(self.periodic_orderbook_snapshot, "orderbook_snapshot"),
             self.safe_task(self.validate_orderbook, "orderbook_validator"),
             self.safe_task(self.periodic_flush, "periodic_flush"),
         ]
