@@ -18,23 +18,24 @@ async def main():
         print("Usage: python3 main.py <SYMBOL>")
         sys.exit(1)
     symbol = sys.argv[1].upper()
-    config = CollectorConfig(
-        symbol=symbol,
-        data_dir=f"./data_{symbol}",
-        orderbook_levels=100,
-        orderbook_snapshot_interval_sec=0.1,
-        open_interest_fetch_interval_sec=1.0,
-        buffer_flush_interval_sec=2.0
-    )
-    collector = BinanceFuturesCollector(config)
+    collector = None
     try:
+        config = CollectorConfig(
+            symbol=symbol,
+            data_dir=f"./data_{symbol}",
+            orderbook_levels=100,
+            orderbook_snapshot_interval_sec=0.1,
+            open_interest_fetch_interval_sec=1.0,
+            buffer_flush_interval_sec=2.0
+        )
+        collector = BinanceFuturesCollector(config)
         await collector.start()
     except KeyboardInterrupt:
         print(f"\n🛑 Received SIGINT. Stopping {symbol} collector...")
     except Exception as e:
         logging.critical(f"💥 UNEXPECTED CRASH: {e}", exc_info=True)
     finally:
-        if collector:
+        if collector is not None:
             await collector.stop()
         print("✅ Collector shut down cleanly.")
 

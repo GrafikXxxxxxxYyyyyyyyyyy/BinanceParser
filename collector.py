@@ -7,7 +7,7 @@ from aiohttp import ClientSession
 from websockets import connect, ConnectionClosed
 from orderbook import OrderBook
 from storage import DataStorage
-from config import CollectorConfig
+from config import CollectorConfig, futures_ws_market, futures_ws_public
 
 logger = logging.getLogger("Collector")
 
@@ -80,7 +80,7 @@ class BinanceFuturesCollector:
                 if snapshot:
                     self.book.apply_snapshot(snapshot)
                     logger.info(f"📸 Snapshot refetched (lastUpdateId={self.book.last_update_id})")
-                    stream_url = f"wss://fstream.binance.com/ws/{self.symbol.lower()}@depth@100ms"
+                    stream_url = futures_ws_public(self.symbol, "depth@100ms")
                     asyncio.create_task(self.websocket_reader(stream_url, self._depth_handler))
                     return
             except Exception as e:
@@ -100,7 +100,7 @@ class BinanceFuturesCollector:
         self.book.apply_snapshot(snapshot)
         logger.info(f"📸 Snapshot received (lastUpdateId={self.book.last_update_id})")
 
-        stream_url = f"wss://fstream.binance.com/ws/{self.symbol.lower()}@depth@100ms"
+        stream_url = futures_ws_public(self.symbol, "depth@100ms")
         asyncio.create_task(self.websocket_reader(stream_url, self._depth_handler))
 
         for _ in range(20):
@@ -297,7 +297,7 @@ class BinanceFuturesCollector:
         while self.running:
             await asyncio.sleep(self.cfg.buffer_flush_interval_sec)
             logger.debug("🔄 Periodic flush triggered")
-            self.storage.flush_all()
+            # Принудительный слив переполненных потоков — до общего flush, иначе буферы уже пустые
             for stream_type, buffer in list(self.storage._buffers.items()):
                 if len(buffer) >= self.cfg.buffer_flush_max_records:
                     logger.info(f"📤 Forced flush for '{stream_type}' (size: {len(buffer)})")
@@ -305,6 +305,7 @@ class BinanceFuturesCollector:
                         self.storage.flush_stream(stream_type)
                     except Exception as e:
                         logger.error(f"💥 Flush failed for '{stream_type}': {e}")
+            self.storage.flush_all()
 
     async def safe_task(self, task_factory, task_name: str):
         while self.running:
@@ -329,10 +330,10 @@ class BinanceFuturesCollector:
         await self._proper_orderbook_init()
 
         streams = [
-            (f"wss://fstream.binance.com/ws/{self.symbol.lower()}@aggTrade", self.handle_agg_trade),
-            (f"wss://fstream.binance.com/ws/{self.symbol.lower()}@trade", self.handle_raw_trade),
-            (f"wss://fstream.binance.com/ws/{self.symbol.lower()}@markPrice@1s", self.handle_mark_price),
-            (f"wss://fstream.binance.com/ws/{self.symbol.lower()}@bookTicker", self.handle_book_ticker),
+            (futures_ws_market(self.symbol, "aggTrade"), self.handle_agg_trade),
+            (futures_ws_market(self.symbol, "trade"), self.handle_raw_trade),
+            (futures_ws_market(self.symbol, "markPrice@1s"), self.handle_mark_price),
+            (futures_ws_public(self.symbol, "bookTicker"), self.handle_book_ticker),
         ]
 
         from functools import partial

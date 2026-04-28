@@ -11,6 +11,7 @@ from websockets import connect, ConnectionClosed
 
 from orderbook import OrderBook
 from buffer import InMemoryBuffer
+from config import futures_ws_market, futures_ws_public
 
 logger = logging.getLogger("LiveCollector")
 
@@ -97,7 +98,7 @@ class LiveCollector:
                 snapshot = await self.fetch_depth_snapshot()
                 if snapshot:
                     self.book.apply_snapshot(snapshot)
-                    stream_url = f"wss://fstream.binance.com/ws/{self.symbol.lower()}@depth@100ms"
+                    stream_url = futures_ws_public(self.symbol, "depth@100ms")
                     asyncio.create_task(self.websocket_reader(stream_url, self._depth_handler))
                     logger.info(f"📸 Snapshot refetched (lastUpdateId={self.book.last_update_id})")
                     return
@@ -115,7 +116,7 @@ class LiveCollector:
         self.book.apply_snapshot(snapshot)
         logger.info(f"📸 Snapshot received (lastUpdateId={self.book.last_update_id})")
 
-        stream_url = f"wss://fstream.binance.com/ws/{self.symbol.lower()}@depth@100ms"
+        stream_url = futures_ws_public(self.symbol, "depth@100ms")
         asyncio.create_task(self.websocket_reader(stream_url, self._depth_handler))
 
         for _ in range(20):
@@ -254,10 +255,10 @@ class LiveCollector:
         await self._proper_orderbook_init()
 
         streams = [
-            (f"wss://fstream.binance.com/ws/{self.symbol.lower()}@aggTrade", self.process_agg_trade),
-            (f"wss://fstream.binance.com/ws/{self.symbol.lower()}@trade", self.process_raw_trade),
-            (f"wss://fstream.binance.com/ws/{self.symbol.lower()}@markPrice@1s", self.process_mark_price),
-            (f"wss://fstream.binance.com/ws/{self.symbol.lower()}@bookTicker", self.process_book_ticker),
+            (futures_ws_market(self.symbol, "aggTrade"), self.process_agg_trade),
+            (futures_ws_market(self.symbol, "trade"), self.process_raw_trade),
+            (futures_ws_market(self.symbol, "markPrice@1s"), self.process_mark_price),
+            (futures_ws_public(self.symbol, "bookTicker"), self.process_book_ticker),
         ]
 
         tasks = []
