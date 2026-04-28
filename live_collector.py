@@ -11,7 +11,7 @@ from websockets import connect, ConnectionClosed
 
 from orderbook import OrderBook
 from buffer import InMemoryBuffer
-from config import futures_ws_market, futures_ws_public
+from config import futures_ws_market, futures_ws_public, unwrap_binance_ws_payload
 
 logger = logging.getLogger("LiveCollector")
 
@@ -222,7 +222,9 @@ class LiveCollector:
                     while self.running:
                         try:
                             msg = await asyncio.wait_for(ws.recv(), timeout=30.0)
-                            data = json.loads(msg)
+                            data = unwrap_binance_ws_payload(json.loads(msg))
+                            if data is None:
+                                continue
                             if asyncio.iscoroutinefunction(handler):
                                 await handler(data)
                             else:
@@ -256,7 +258,7 @@ class LiveCollector:
 
         streams = [
             (futures_ws_market(self.symbol, "aggTrade"), self.process_agg_trade),
-            (futures_ws_market(self.symbol, "trade"), self.process_raw_trade),
+            (futures_ws_public(self.symbol, "trade"), self.process_raw_trade),
             (futures_ws_market(self.symbol, "markPrice@1s"), self.process_mark_price),
             (futures_ws_public(self.symbol, "bookTicker"), self.process_book_ticker),
         ]

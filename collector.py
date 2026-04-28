@@ -7,7 +7,12 @@ from aiohttp import ClientSession
 from websockets import connect, ConnectionClosed
 from orderbook import OrderBook
 from storage import DataStorage
-from config import CollectorConfig, futures_ws_market, futures_ws_public
+from config import (
+    CollectorConfig,
+    futures_ws_market,
+    futures_ws_public,
+    unwrap_binance_ws_payload,
+)
 
 logger = logging.getLogger("Collector")
 
@@ -225,7 +230,9 @@ class BinanceFuturesCollector:
                     while self.running:
                         try:
                             msg = await asyncio.wait_for(ws.recv(), timeout=30.0)
-                            data = json.loads(msg)
+                            data = unwrap_binance_ws_payload(json.loads(msg))
+                            if data is None:
+                                continue
                             if asyncio.iscoroutinefunction(handler):
                                 await handler(data)
                             else:
@@ -331,7 +338,7 @@ class BinanceFuturesCollector:
 
         streams = [
             (futures_ws_market(self.symbol, "aggTrade"), self.handle_agg_trade),
-            (futures_ws_market(self.symbol, "trade"), self.handle_raw_trade),
+            (futures_ws_public(self.symbol, "trade"), self.handle_raw_trade),
             (futures_ws_market(self.symbol, "markPrice@1s"), self.handle_mark_price),
             (futures_ws_public(self.symbol, "bookTicker"), self.handle_book_ticker),
         ]

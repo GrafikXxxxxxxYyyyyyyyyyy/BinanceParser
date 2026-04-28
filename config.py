@@ -1,19 +1,41 @@
+import json
 from dataclasses import dataclass
+from typing import Any, Dict, Optional
 
-# Binance USDⓈ-M Futures WebSocket routing (legacy `…/ws/` decommissioned; use /public и /market):
+# Public: depth, bookTicker, и тиковые сделки `<symbol>@trade` (см. миграцию WS; @trade не на /market).
 # https://developers.binance.com/docs/derivatives/usds-margined-futures/websocket-market-streams/Important-WebSocket-Change-Notice
 WS_FUTURES_PUBLIC_BASE = "wss://fstream.binance.com/public/ws"
 WS_FUTURES_MARKET_BASE = "wss://fstream.binance.com/market/ws"
 
 
 def futures_ws_public(symbol: str, stream_rest: str) -> str:
-    """High-frequency streams: depth, bookTicker, etc. stream_rest example: depth@100ms, bookTicker."""
+    """High-frequency / public: depth@100ms, bookTicker, trade (тиковые сделки на /public, не на /market)."""
     return f"{WS_FUTURES_PUBLIC_BASE}/{symbol.lower()}@{stream_rest}"
 
 
 def futures_ws_market(symbol: str, stream_rest: str) -> str:
-    """Regular market streams: aggTrade, trade, markPrice@1s, etc."""
+    """Regular market streams: aggTrade, markPrice@1s, etc."""
     return f"{WS_FUTURES_MARKET_BASE}/{symbol.lower()}@{stream_rest}"
+
+
+def unwrap_binance_ws_payload(parsed: Any) -> Optional[Dict[str, Any]]:
+    """
+    Path `/ws/` sends the event dict as root. `/stream` uses `{"stream":...,"data":{...}}`
+    (`data` can be JSON string). Subscribe acks `{result:null,"id":...}` yield None.
+    """
+    if not isinstance(parsed, dict):
+        return None
+    inner = parsed.get("data")
+    if isinstance(inner, str):
+        try:
+            inner = json.loads(inner)
+        except json.JSONDecodeError:
+            inner = None
+    if isinstance(inner, dict):
+        return inner
+    if parsed.get("result") is None and "id" in parsed and "e" not in parsed:
+        return None
+    return parsed
 
 
 @dataclass
