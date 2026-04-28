@@ -177,6 +177,8 @@ class LiveCollector:
         self._process_depth_diff(msg)
 
     def process_agg_trade(self, msg: Dict[str, Any]):
+        if msg.get("e") != "aggTrade":
+            return
         self._buffer("aggTrades", {
             "tradeId": msg["a"],
             "price": float(msg["p"]),
@@ -186,6 +188,8 @@ class LiveCollector:
         })
 
     def process_raw_trade(self, msg: Dict[str, Any]):
+        if msg.get("e") != "trade":
+            return
         self._buffer("rawTrades", {
             "id": msg["t"],
             "price": float(msg["p"]),

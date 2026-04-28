@@ -32,6 +32,8 @@ def unwrap_binance_ws_payload(parsed: Any) -> Optional[Dict[str, Any]]:
         except json.JSONDecodeError:
             inner = None
     if isinstance(inner, dict):
+        if not inner:
+            return None
         return inner
     if parsed.get("result") is None and "id" in parsed and "e" not in parsed:
         return None
